@@ -498,6 +498,32 @@ fn runs_every_agent_in_global_yolo() {
 }
 
 #[test]
+fn gives_codex_leads_developer_instructions_at_launch() {
+    run_agent_flow_with_lead(
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        herdr_cadence::config::Harness::Codex,
+    );
+}
+
+#[test]
+fn keeps_claude_lead_instructions_as_a_post_launch_prompt() {
+    run_agent_flow_with_lead(
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        herdr_cadence::config::Harness::Claude,
+    );
+}
+
+#[test]
 fn starts_dirty_but_blocks_agents_until_clean() {
     run_agent_flow(true, false, true, false, false, false);
 }
@@ -520,6 +546,26 @@ fn run_agent_flow(
     force_primary_credit_failure: bool,
     force_tab_cleanup_retry: bool,
 ) {
+    run_agent_flow_with_lead(
+        use_worktree,
+        global_yolo,
+        dirty_at_start,
+        create_out_of_scope_commit,
+        force_primary_credit_failure,
+        force_tab_cleanup_retry,
+        herdr_cadence::config::Harness::Opencode,
+    );
+}
+
+fn run_agent_flow_with_lead(
+    use_worktree: bool,
+    global_yolo: bool,
+    dirty_at_start: bool,
+    create_out_of_scope_commit: bool,
+    force_primary_credit_failure: bool,
+    force_tab_cleanup_retry: bool,
+    lead_harness: herdr_cadence::config::Harness,
+) {
     let repo = repo();
     let state = tempfile::tempdir().unwrap();
     assert!(
@@ -530,7 +576,7 @@ fn run_agent_flow(
     let config_path = repo.path().join(".cadence.toml");
     let mut config: herdr_cadence::config::Config =
         toml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-    config.lead.harness = herdr_cadence::config::Harness::Opencode;
+    config.lead.harness = lead_harness;
     config.lead.model = Some("openai/lead-model".into());
     {
         let qa = config.agents.roles.get_mut("qa").unwrap();
@@ -871,7 +917,6 @@ fi
     );
     assert!(calls.contains("agent start cadence-lead-"));
     assert_eq!(calls.matches("agent start cadence-lead-").count(), 3);
-    assert!(calls.contains("--kind opencode"));
     assert!(calls.contains(&format!(
         "- qa [{}]: Validates test behavior",
         if use_worktree {
@@ -900,14 +945,33 @@ fi
         "send one consolidated developer correction, and have the reviewer recheck only changed areas and prior Highs"
     ));
     assert!(calls.contains("Label communicated findings as High (Blockers), Mid, Low, or Wish"));
-    let lead_launch =
-        "--kind opencode --pane pane-lead --timeout 120000 -- --model openai/lead-model#high";
-    assert!(calls.contains(lead_launch));
-    if global_yolo {
-        assert!(calls.contains(&format!("{lead_launch} --auto")));
-        assert!(calls.contains("YOLO removes permission prompts, not scope or safety limits"));
-    } else {
-        assert!(!calls.contains(&format!("{lead_launch} --auto")));
+    match lead_harness {
+        herdr_cadence::config::Harness::Codex => {
+            let lead_launch = "--kind codex --pane pane-lead --timeout 120000 -- --model openai/lead-model --config model_reasoning_effort=\"high\" --config developer_instructions=\"You are Lead for Cadence run";
+            assert!(calls.contains(lead_launch));
+            assert!(!calls.contains("agent prompt cadence-lead-"));
+            assert!(calls.contains("developer_instructions=\"You are Lead for Cadence run"));
+        }
+        herdr_cadence::config::Harness::Claude => {
+            let lead_launch = "--kind claude --pane pane-lead --timeout 120000 -- --model openai/lead-model --effort high";
+            assert!(calls.contains(lead_launch));
+            assert!(calls.contains("agent prompt cadence-lead-"));
+            assert!(!calls.contains("developer_instructions="));
+        }
+        herdr_cadence::config::Harness::Opencode => {
+            let lead_launch = "--kind opencode --pane pane-lead --timeout 120000 -- --model openai/lead-model#high";
+            assert!(calls.contains(lead_launch));
+            assert!(calls.contains("agent prompt cadence-lead-"));
+            assert!(!calls.contains("developer_instructions="));
+            if global_yolo {
+                assert!(calls.contains(&format!("{lead_launch} --auto")));
+                assert!(
+                    calls.contains("YOLO removes permission prompts, not scope or safety limits")
+                );
+            } else {
+                assert!(!calls.contains(&format!("{lead_launch} --auto")));
+            }
+        }
     }
     assert!(calls.contains("Checkout mode is fixed by role"));
     if use_worktree {

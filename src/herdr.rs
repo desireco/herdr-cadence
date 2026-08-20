@@ -35,6 +35,13 @@ pub struct CreatedTerminal {
     pub checkout_path: Option<String>,
 }
 
+struct AgentLaunchOptions<'a> {
+    model: Option<&'a str>,
+    reasoning_effort: ReasoningEffort,
+    agent_args: &'a [String],
+    developer_instructions: Option<&'a str>,
+}
+
 impl Herdr {
     pub fn from_env() -> Self {
         Self {
@@ -197,8 +204,58 @@ impl Herdr {
         reasoning_effort: ReasoningEffort,
         agent_args: &[String],
     ) -> Result<()> {
+        self.start_agent_with_options(
+            name,
+            harness,
+            pane_id,
+            AgentLaunchOptions {
+                model,
+                reasoning_effort,
+                agent_args,
+                developer_instructions: None,
+            },
+        )
+    }
+
+    pub fn start_codex_lead(
+        &self,
+        name: &str,
+        pane_id: &str,
+        model: Option<&str>,
+        reasoning_effort: ReasoningEffort,
+        agent_args: &[String],
+        developer_instructions: &str,
+    ) -> Result<()> {
+        self.start_agent_with_options(
+            name,
+            Harness::Codex,
+            pane_id,
+            AgentLaunchOptions {
+                model,
+                reasoning_effort,
+                agent_args,
+                developer_instructions: Some(developer_instructions),
+            },
+        )
+    }
+
+    fn start_agent_with_options(
+        &self,
+        name: &str,
+        harness: Harness,
+        pane_id: &str,
+        options: AgentLaunchOptions<'_>,
+    ) -> Result<()> {
         self.wait_for_available_shell(pane_id)?;
-        let args = start_agent_args(name, harness, pane_id, model, reasoning_effort, agent_args)?;
+        let args = start_agent_args(
+            name,
+            harness,
+            pane_id,
+            options.model,
+            options.reasoning_effort,
+            options.agent_args,
+            options.developer_instructions,
+        )?;
         for delay in AGENT_PANE_BUSY_RETRY_DELAYS {
             let output = self.output(&args)?;
             if output.status.success() {
@@ -277,6 +334,7 @@ fn start_agent_args(
     model: Option<&str>,
     reasoning_effort: ReasoningEffort,
     agent_args: &[String],
+    developer_instructions: Option<&str>,
 ) -> Result<Vec<String>> {
     let model = launch_model(harness, model, reasoning_effort)?;
     let mut args = vec![
@@ -290,7 +348,11 @@ fn start_agent_args(
         "--timeout".into(),
         "120000".into(),
     ];
-    if model.is_some() || reasoning_effort.as_str().is_some() || !agent_args.is_empty() {
+    if model.is_some()
+        || reasoning_effort.as_str().is_some()
+        || !agent_args.is_empty()
+        || (harness == Harness::Codex && developer_instructions.is_some())
+    {
         args.push("--".into());
     }
     if let Some(model) = &model {
@@ -305,6 +367,16 @@ fn start_agent_args(
             ]),
             Harness::Opencode => {}
         }
+    }
+    if harness == Harness::Codex
+        && let Some(developer_instructions) = developer_instructions
+    {
+        let encoded = serde_json::to_string(developer_instructions)
+            .context("failed to encode Codex developer instructions")?;
+        args.extend([
+            "--config".into(),
+            format!("developer_instructions={encoded}"),
+        ]);
     }
     args.extend(agent_args.iter().cloned());
     Ok(args)
@@ -428,6 +500,7 @@ mod tests {
             Some("opus"),
             ReasoningEffort::High,
             &["--dangerously-skip-permissions".into()],
+            None,
         )
         .unwrap();
 
@@ -451,5 +524,75 @@ mod tests {
                 "--dangerously-skip-permissions",
             ]
         );
+    }
+
+    #[test]
+    fn passes_codex_developer_instructions_as_one_escaped_config_value() {
+        let instructions = "Lead at C:\\repo\\\"quoted\"\nNext line\r\n tab\t";
+        let args = start_agent_args(
+            "lead",
+            Harness::Codex,
+            "pane-1",
+            Some("gpt-lead"),
+            ReasoningEffort::High,
+            &["--add-dir".into(), "/state/with space".into()],
+            Some(instructions),
+        )
+        .unwrap();
+
+        assert_eq!(
+            args,
+            [
+                "agent",
+                "start",
+                "lead",
+                "--kind",
+                "codex",
+                "--pane",
+                "pane-1",
+                "--timeout",
+                "120000",
+                "--",
+                "--model",
+                "gpt-lead",
+                "--config",
+                "model_reasoning_effort=\"high\"",
+                "--config",
+                "developer_instructions=\"Lead at C:\\\\repo\\\\\\\"quoted\\\"\\nNext line\\r\\n tab\\t\"",
+                "--add-dir",
+                "/state/with space",
+            ]
+        );
+
+        let developer_config = args
+            .iter()
+            .find(|arg| arg.starts_with("developer_instructions="))
+            .unwrap();
+        let parsed: toml::Value = toml::from_str(developer_config).unwrap();
+        assert_eq!(
+            parsed["developer_instructions"].as_str(),
+            Some(instructions)
+        );
+    }
+
+    #[test]
+    fn does_not_add_developer_instructions_when_not_supplied() {
+        for harness in [Harness::Codex, Harness::Claude, Harness::Opencode] {
+            let args = start_agent_args(
+                "agent",
+                harness,
+                "pane-1",
+                None,
+                ReasoningEffort::Default,
+                &[],
+                None,
+            )
+            .unwrap();
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg.starts_with("developer_instructions="))
+            );
+        }
     }
 }
