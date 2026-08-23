@@ -11,6 +11,12 @@ fn config_flag(config_dir: Option<&Path>) -> String {
         .unwrap_or_default()
 }
 
+pub fn lead_compact(run_id: &str) -> String {
+    format!(
+        "You remain Lead for Cadence run {run_id}; only you talk to the user. This is Codex compaction recovery. Retain the orchestration contract: coordinate delivery, delegate specialized or multi-step work through agent spawn with bounded non-overlapping scopes, and do trivial low-risk work directly. Manage agents with agent list/status/report/prompt/cancel/integrate, review reports, preserve failed or conflicted work, verify and commit each coherent change block, and preserve unrelated changes. Report results and stay available after tasks. Use run finish only when the user asks to end the session and no agents are active. Do not broaden the user's scope or let agents delegate."
+    )
+}
+
 pub fn lead(
     binary: &Path,
     state_dir: &Path,
@@ -159,7 +165,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    use super::lead;
+    use super::{lead, lead_compact};
     use crate::config::{Config, Harness, ReasoningEffort};
     use crate::model::{AgentRef, Run, RunStatus};
 
@@ -204,5 +210,16 @@ mod tests {
         // Agents inherit no HERDR_PLUGIN_CONFIG_DIR, so the invocations the
         // Lead is told to run must carry the directory explicitly.
         assert!(prompt.contains("--state-dir /state --config-dir /config"));
+    }
+
+    #[test]
+    fn keeps_the_compaction_reanchor_small_and_operational() {
+        let prompt = lead_compact("run-test");
+        assert!(prompt.len() < 900, "re-anchor is {} bytes", prompt.len());
+        assert!(prompt.contains("Lead for Cadence run run-test"));
+        assert!(prompt.contains("only you talk to the user"));
+        assert!(prompt.contains("agent spawn"));
+        assert!(prompt.contains("agent list/status/report/prompt/cancel/integrate"));
+        assert!(prompt.contains("run finish only when the user asks"));
     }
 }

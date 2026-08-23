@@ -498,7 +498,39 @@ fn runs_every_agent_in_global_yolo() {
 }
 
 #[test]
-fn gives_codex_leads_developer_instructions_at_launch() {
+fn codex_compact_hook_emits_session_start_context_json() {
+    let repo = repo();
+    let state = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-cadence"))
+        .args([
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "--project-root",
+            repo.path().to_str().unwrap(),
+            "hook",
+            "codex-session-start",
+        ])
+        .env("CADENCE_RUN_ID", "run-hook-test")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    let context = value["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(context.contains("Lead for Cadence run run-hook-test"));
+    assert!(context.contains("only you talk to the user"));
+    assert!(context.contains("agent spawn"));
+    assert!(context.contains("run finish only when the user asks"));
+}
+
+#[test]
+fn starts_codex_leads_with_a_compact_session_hook() {
     run_agent_flow_with_lead(
         false,
         false,
@@ -947,10 +979,14 @@ fi
     assert!(calls.contains("Label communicated findings as High (Blockers), Mid, Low, or Wish"));
     match lead_harness {
         herdr_cadence::config::Harness::Codex => {
-            let lead_launch = "--kind codex --pane pane-lead --timeout 120000 -- --model openai/lead-model --config model_reasoning_effort=\"high\" --config developer_instructions=\"You are Lead for Cadence run";
+            let lead_launch = "--kind codex --pane pane-lead --timeout 120000 -- --model openai/lead-model --config model_reasoning_effort=\"high\" --config hooks.SessionStart=[{matcher=\"^compact$\",hooks=[{type=\"command\",command=\"'";
             assert!(calls.contains(lead_launch));
-            assert!(!calls.contains("agent prompt cadence-lead-"));
-            assert!(calls.contains("developer_instructions=\"You are Lead for Cadence run"));
+            assert!(calls.contains(
+                "--config hooks.state={\"/<session-flags>/config.toml:session_start:0:0\"={trusted_hash=\"sha256:"
+            ));
+            assert!(!calls.contains("dangerously-bypass-hook-trust"));
+            assert!(calls.contains("agent prompt cadence-lead-"));
+            assert!(!calls.contains("developer_instructions="));
         }
         herdr_cadence::config::Harness::Claude => {
             let lead_launch = "--kind claude --pane pane-lead --timeout 120000 -- --model openai/lead-model --effort high";

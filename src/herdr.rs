@@ -5,7 +5,8 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::config::{Harness, ReasoningEffort};
 
@@ -35,12 +36,8 @@ pub struct CreatedTerminal {
     pub checkout_path: Option<String>,
 }
 
-struct AgentLaunchOptions<'a> {
-    model: Option<&'a str>,
-    reasoning_effort: ReasoningEffort,
-    agent_args: &'a [String],
-    developer_instructions: Option<&'a str>,
-}
+const CODEX_SESSION_HOOK_KEY: &str = "/<session-flags>/config.toml:session_start:0:0";
+const CODEX_SESSION_HOOK_MATCHER: &str = "^compact$";
 
 impl Herdr {
     pub fn from_env() -> Self {
@@ -204,17 +201,7 @@ impl Herdr {
         reasoning_effort: ReasoningEffort,
         agent_args: &[String],
     ) -> Result<()> {
-        self.start_agent_with_options(
-            name,
-            harness,
-            pane_id,
-            AgentLaunchOptions {
-                model,
-                reasoning_effort,
-                agent_args,
-                developer_instructions: None,
-            },
-        )
+        self.start_agent_with_options(name, harness, pane_id, model, reasoning_effort, agent_args)
     }
 
     pub fn start_codex_lead(
@@ -224,18 +211,17 @@ impl Herdr {
         model: Option<&str>,
         reasoning_effort: ReasoningEffort,
         agent_args: &[String],
-        developer_instructions: &str,
+        cadence_binary: &Path,
     ) -> Result<()> {
+        let mut args = codex_session_hook_args(cadence_binary)?;
+        args.extend(agent_args.iter().cloned());
         self.start_agent_with_options(
             name,
             Harness::Codex,
             pane_id,
-            AgentLaunchOptions {
-                model,
-                reasoning_effort,
-                agent_args,
-                developer_instructions: Some(developer_instructions),
-            },
+            model,
+            reasoning_effort,
+            &args,
         )
     }
 
@@ -244,18 +230,12 @@ impl Herdr {
         name: &str,
         harness: Harness,
         pane_id: &str,
-        options: AgentLaunchOptions<'_>,
+        model: Option<&str>,
+        reasoning_effort: ReasoningEffort,
+        agent_args: &[String],
     ) -> Result<()> {
         self.wait_for_available_shell(pane_id)?;
-        let args = start_agent_args(
-            name,
-            harness,
-            pane_id,
-            options.model,
-            options.reasoning_effort,
-            options.agent_args,
-            options.developer_instructions,
-        )?;
+        let args = start_agent_args(name, harness, pane_id, model, reasoning_effort, agent_args)?;
         for delay in AGENT_PANE_BUSY_RETRY_DELAYS {
             let output = self.output(&args)?;
             if output.status.success() {
@@ -334,7 +314,6 @@ fn start_agent_args(
     model: Option<&str>,
     reasoning_effort: ReasoningEffort,
     agent_args: &[String],
-    developer_instructions: Option<&str>,
 ) -> Result<Vec<String>> {
     let model = launch_model(harness, model, reasoning_effort)?;
     let mut args = vec![
@@ -348,11 +327,7 @@ fn start_agent_args(
         "--timeout".into(),
         "120000".into(),
     ];
-    if model.is_some()
-        || reasoning_effort.as_str().is_some()
-        || !agent_args.is_empty()
-        || (harness == Harness::Codex && developer_instructions.is_some())
-    {
+    if model.is_some() || reasoning_effort.as_str().is_some() || !agent_args.is_empty() {
         args.push("--".into());
     }
     if let Some(model) = &model {
@@ -368,18 +343,68 @@ fn start_agent_args(
             Harness::Opencode => {}
         }
     }
-    if harness == Harness::Codex
-        && let Some(developer_instructions) = developer_instructions
-    {
-        let encoded = serde_json::to_string(developer_instructions)
-            .context("failed to encode Codex developer instructions")?;
-        args.extend([
-            "--config".into(),
-            format!("developer_instructions={encoded}"),
-        ]);
-    }
     args.extend(agent_args.iter().cloned());
     Ok(args)
+}
+
+fn codex_session_hook_args(cadence_binary: &Path) -> Result<Vec<String>> {
+    let command = format!("{} hook codex-session-start", shell_quote(cadence_binary));
+    let command_literal = serde_json::to_string(&command)
+        .context("failed to encode Codex SessionStart hook command")?;
+    let trust_hash = codex_session_hook_hash(&command);
+    let hook_config = format!(
+        "hooks.SessionStart=[{{matcher=\"{CODEX_SESSION_HOOK_MATCHER}\",hooks=[{{type=\"command\",command={command_literal},async=false,timeout=600}}]}}]"
+    );
+    let state_config =
+        format!("hooks.state={{\"{CODEX_SESSION_HOOK_KEY}\"={{trusted_hash=\"{trust_hash}\"}}}}");
+    Ok(vec![
+        "--config".into(),
+        hook_config,
+        "--config".into(),
+        state_config,
+    ])
+}
+
+fn codex_session_hook_hash(command: &str) -> String {
+    let identity = json!({
+        "event_name": "session_start",
+        "hooks": [{
+            "async": false,
+            "command": command,
+            "timeout": 600,
+            "type": "command",
+        }],
+        "matcher": CODEX_SESSION_HOOK_MATCHER,
+    });
+    let canonical = canonical_json(&identity);
+    let serialized = serde_json::to_vec(&canonical).expect("hook identity is serializable");
+    let digest = Sha256::digest(serialized);
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256:{hex}")
+}
+
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut canonical = serde_json::Map::new();
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                canonical.insert(key.clone(), canonical_json(&map[&key]));
+            }
+            Value::Object(canonical)
+        }
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json).collect()),
+        other => other.clone(),
+    }
+}
+
+fn shell_quote(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn lead_label(root: &Path) -> String {
@@ -500,7 +525,6 @@ mod tests {
             Some("opus"),
             ReasoningEffort::High,
             &["--dangerously-skip-permissions".into()],
-            None,
         )
         .unwrap();
 
@@ -527,72 +551,46 @@ mod tests {
     }
 
     #[test]
-    fn passes_codex_developer_instructions_as_one_escaped_config_value() {
-        let instructions = "Lead at C:\\repo\\\"quoted\"\nNext line\r\n tab\t";
-        let args = start_agent_args(
-            "lead",
-            Harness::Codex,
-            "pane-1",
-            Some("gpt-lead"),
-            ReasoningEffort::High,
-            &["--add-dir".into(), "/state/with space".into()],
-            Some(instructions),
-        )
-        .unwrap();
-
+    fn generates_a_quoted_compact_hook_and_exact_trust_config() {
+        let args = codex_session_hook_args(Path::new("/tmp/Cadence Agent's/bin")).unwrap();
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0], "--config");
+        let hook_value = args[1].split_once('=').unwrap().1;
+        let hook_table: toml::Value = toml::from_str(&format!("value = {hook_value}"))
+            .expect("generated hook config should be valid TOML");
         assert_eq!(
-            args,
-            [
-                "agent",
-                "start",
-                "lead",
-                "--kind",
-                "codex",
-                "--pane",
-                "pane-1",
-                "--timeout",
-                "120000",
-                "--",
-                "--model",
-                "gpt-lead",
-                "--config",
-                "model_reasoning_effort=\"high\"",
-                "--config",
-                "developer_instructions=\"Lead at C:\\\\repo\\\\\\\"quoted\\\"\\nNext line\\r\\n tab\\t\"",
-                "--add-dir",
-                "/state/with space",
-            ]
+            hook_table["value"][0]["matcher"].as_str(),
+            Some("^compact$")
         );
-
-        let developer_config = args
-            .iter()
-            .find(|arg| arg.starts_with("developer_instructions="))
-            .unwrap();
-        let parsed: toml::Value = toml::from_str(developer_config).unwrap();
         assert_eq!(
-            parsed["developer_instructions"].as_str(),
-            Some(instructions)
+            hook_table["value"][0]["hooks"][0]["command"].as_str(),
+            Some("'/tmp/Cadence Agent'\\''s/bin' hook codex-session-start")
+        );
+        assert_eq!(
+            hook_table["value"][0]["hooks"][0]["async"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            hook_table["value"][0]["hooks"][0]["timeout"].as_integer(),
+            Some(600)
+        );
+        assert_eq!(args[2], "--config");
+        assert!(args[3].starts_with(
+            "hooks.state={\"/<session-flags>/config.toml:session_start:0:0\"={trusted_hash=\"sha256:"
+        ));
+        assert!(args[3].ends_with("\"}}"));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("dangerously-bypass-hook-trust"))
         );
     }
 
     #[test]
-    fn does_not_add_developer_instructions_when_not_supplied() {
-        for harness in [Harness::Codex, Harness::Claude, Harness::Opencode] {
-            let args = start_agent_args(
-                "agent",
-                harness,
-                "pane-1",
-                None,
-                ReasoningEffort::Default,
-                &[],
-                None,
-            )
-            .unwrap();
-            assert!(
-                !args
-                    .iter()
-                    .any(|arg| arg.starts_with("developer_instructions="))
-            );
-        }
+    fn uses_codex_normalized_hook_hash() {
+        assert_eq!(
+            codex_session_hook_hash("true"),
+            "sha256:7c0553aa6deec045741238c315c995e8222b35db4b5964ca839118324e0a2765"
+        );
     }
 }

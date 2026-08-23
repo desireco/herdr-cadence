@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use herdr_cadence::app::{App, context_project_path, context_workspace_id};
+use herdr_cadence::prompts;
 
 #[derive(Parser)]
 #[command(name = "herdr-cadence", version, about)]
@@ -27,6 +28,11 @@ enum Command {
     },
     Startup,
     Event,
+    #[command(hide = true)]
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
+    },
     Run {
         #[command(subcommand)]
         command: RunCommand,
@@ -35,6 +41,12 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum HookCommand {
+    #[command(name = "codex-session-start", hide = true)]
+    CodexSessionStart,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -117,7 +129,10 @@ fn run() -> Result<()> {
         .config_dir
         .or_else(|| std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(PathBuf::from))
         .filter(|dir| !dir.as_os_str().is_empty());
-    let runtime_only = matches!(&cli.command, Command::Startup | Command::Event);
+    let runtime_only = matches!(
+        &cli.command,
+        Command::Startup | Command::Event | Command::Hook { .. }
+    );
     let app = if runtime_only {
         App::new_runtime(root, state_dir, config_dir)?
     } else {
@@ -139,6 +154,18 @@ fn run() -> Result<()> {
                 .context("HERDR_PLUGIN_EVENT_JSON is required")?;
             app.handle_event(&name, &event)?
         }
+        Command::Hook { command } => match command {
+            HookCommand::CodexSessionStart => {
+                let run_id = std::env::var("CADENCE_RUN_ID")
+                    .context("CADENCE_RUN_ID is required for the Codex SessionStart hook")?;
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": prompts::lead_compact(&run_id),
+                    }
+                })
+            }
+        },
         Command::Run { command } => match command {
             RunCommand::Status => app.status()?,
             RunCommand::Finish { force } => app.finish_run(force)?,

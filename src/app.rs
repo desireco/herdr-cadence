@@ -159,15 +159,6 @@ impl App {
             Ok(())
         })?;
         let agent_args = yolo_agent_args(run.lead.harness, config.yolo);
-        let prompt = prompts::lead(
-            &self.binary,
-            self.state.dir(),
-            self.global_config_dir(),
-            &self.root,
-            &run,
-            &config,
-            checkout_clean,
-        );
         let launch = if run.lead.harness == Harness::Codex {
             self.herdr.start_codex_lead(
                 &run.lead.name,
@@ -175,7 +166,7 @@ impl App {
                 run.lead.model.as_deref(),
                 run.lead.reasoning_effort,
                 &agent_args,
-                &prompt,
+                &self.binary,
             )
         } else {
             self.herdr.start_agent(
@@ -191,9 +182,16 @@ impl App {
             self.set_run_error(&key, &run.id, &error.to_string())?;
             return Err(error.context("failed to start the Lead"));
         }
-        if run.lead.harness != Harness::Codex {
-            self.herdr.prompt_agent(&run.lead.name, &prompt)?;
-        }
+        let prompt = prompts::lead(
+            &self.binary,
+            self.state.dir(),
+            self.global_config_dir(),
+            &self.root,
+            &run,
+            &config,
+            checkout_clean,
+        );
+        self.herdr.prompt_agent(&run.lead.name, &prompt)?;
         self.state.update(|store| {
             active_run_mut(store, &key)?.last_error = None;
             Ok(())
