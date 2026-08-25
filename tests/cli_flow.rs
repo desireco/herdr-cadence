@@ -5,6 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
+use serde_json::json;
+
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
@@ -76,6 +78,230 @@ fn cadence_with_config_dir(root: &Path, state: &Path, config_dir: &Path, args: &
         .args(args)
         .output()
         .unwrap()
+}
+
+fn start_prune_fixture(
+    repo: &Path,
+    state: &Path,
+    live_lead: bool,
+) -> (tempfile::TempDir, String, serde_json::Value) {
+    let initialized = cadence(repo, state, &["action", "init"]);
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+
+    let key = herdr_cadence::state::project_key(repo);
+    let lead_name = format!("cadence-lead-{key}");
+    let active_run = json!({
+        "id": "run-active",
+        "status": "active",
+        "base_branch": "main",
+        "base_workspace_id": "original-workspace",
+        "lead": {
+            "name": lead_name,
+            "harness": "claude",
+            "model": "old-lead-model",
+            "reasoning_effort": "low",
+            "workspace_id": "existing-workspace",
+            "tab_id": "existing-tab",
+            "pane_id": "existing-pane"
+        },
+        "created_unix_ms": 123,
+        "next_agent": 41,
+        "agents": {
+            "clean": {
+                "id": "clean",
+                "title": "Clean integrated agent",
+                "task": "Finished task",
+                "scope": ["src/old"],
+                "acceptance": ["Task is complete"],
+                "harness": "codex",
+                "use_worktree": true,
+                "branch": "cadence/old/clean",
+                "base_sha": "base",
+                "agent_name": "cadence-old-clean",
+                "status": "integrated",
+                "report": {
+                    "status": "completed",
+                    "summary": "Finished task"
+                }
+            },
+            "working": {
+                "id": "working",
+                "title": "Current agent",
+                "task": "Current task",
+                "scope": ["src/current"],
+                "acceptance": ["Task is complete"],
+                "harness": "codex",
+                "use_worktree": true,
+                "branch": "cadence/current/working",
+                "base_sha": "base",
+                "agent_name": "cadence-current-working",
+                "status": "working"
+            },
+            "retained": {
+                "id": "retained",
+                "title": "Retained integrated agent",
+                "task": "Finished task with a resource",
+                "scope": ["src/retained"],
+                "acceptance": ["Task is complete"],
+                "harness": "codex",
+                "use_worktree": true,
+                "branch": "cadence/old/retained",
+                "base_sha": "base",
+                "agent_name": "cadence-old-retained",
+                "status": "integrated",
+                "workspace_id": "stale-workspace"
+            }
+        }
+    });
+    let old_run = json!({
+        "id": "run-old",
+        "status": "completed",
+        "base_branch": "main",
+        "base_workspace_id": "old-workspace",
+        "lead": {"name": "cadence-lead-old", "harness": "codex"},
+        "created_unix_ms": 99,
+        "next_agent": 2,
+        "agents": {}
+    });
+    let other_project = json!({
+        "root": "/sentinel/project",
+        "active_run": "sentinel-run",
+        "runs": {
+            "sentinel-run": {
+                "id": "sentinel-run",
+                "status": "active",
+                "base_branch": "main",
+                "base_workspace_id": "sentinel-workspace",
+                "lead": {"name": "sentinel-lead", "harness": "codex"},
+                "created_unix_ms": 456,
+                "next_agent": 1,
+                "agents": {}
+            }
+        }
+    });
+    let original_store = json!({
+        "schema_version": 1,
+        "projects": {
+            key.clone(): {
+                "root": repo.display().to_string(),
+                "active_run": "run-active",
+                "runs": {
+                    "run-active": active_run,
+                    "run-old": old_run
+                }
+            },
+            "sentinel-project": other_project
+        }
+    });
+    fs::write(
+        state.join("state.json"),
+        serde_json::to_vec_pretty(&original_store).unwrap(),
+    )
+    .unwrap();
+    let expected_store = serde_json::to_value(
+        serde_json::from_value::<herdr_cadence::model::Store>(original_store).unwrap(),
+    )
+    .unwrap();
+
+    let fake_dir = tempfile::tempdir().unwrap();
+    let fake = fake_dir.path().join("herdr");
+    let live_marker = fake_dir.path().join("live-lead");
+    if live_lead {
+        fs::write(&live_marker, "live\n").unwrap();
+    }
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1 $2" = "agent get" ]; then
+  case "$3" in
+    cadence-lead-*)
+      if [ -e '{}' ]; then
+        exit 0
+      fi
+      ;;
+  esac
+  exit 1
+fi
+if [ "$1 $2" = "tab create" ]; then
+  printf '%s\n' '{{"id":"test","result":{{"tab":{{"tab_id":"relaunched-tab"}},"root_pane":{{"pane_id":"relaunched-pane"}}}}}}'
+  exit 0
+fi
+if [ "$1 $2" = "pane process-info" ]; then
+  printf '%s\n' '{{"id":"test","result":{{"type":"pane_process_info","process_info":{{"pane_id":"relaunched-pane","shell_pid":123,"foreground_process_group_id":123}}}}}}'
+  exit 0
+fi
+exit 0
+"#,
+        live_marker.display()
+    );
+    fs::write(&fake, script).unwrap();
+    let mut permissions = fs::metadata(&fake).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake, permissions).unwrap();
+    (fake_dir, key, expected_store)
+}
+
+fn run_start_prune_fixture(live_lead: bool) {
+    let repo = repo();
+    let state = tempfile::tempdir().unwrap();
+    let (fake_dir, key, original_store) = start_prune_fixture(repo.path(), state.path(), live_lead);
+    let result = Command::new(env!("CARGO_BIN_EXE_herdr-cadence"))
+        .args([
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "--project-root",
+            repo.path().to_str().unwrap(),
+            "action",
+            "start",
+        ])
+        .env("HERDR_BIN_PATH", fake_dir.path().join("herdr"))
+        .env("HERDR_WORKSPACE_ID", "new-workspace")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let result_value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        result_value["status"],
+        if live_lead { "focused" } else { "started" }
+    );
+
+    let state_path = state.path().join("state.json");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(stored["schema_version"], 1);
+    let project = &stored["projects"][&key];
+    assert_eq!(project["active_run"], "run-active");
+    assert_eq!(
+        project["runs"]["run-old"],
+        original_store["projects"][&key]["runs"]["run-old"]
+    );
+    assert_eq!(
+        stored["projects"]["sentinel-project"],
+        original_store["projects"]["sentinel-project"]
+    );
+
+    let mut expected_run = original_store["projects"][&key]["runs"]["run-active"].clone();
+    expected_run["agents"]
+        .as_object_mut()
+        .unwrap()
+        .remove("clean");
+    if !live_lead {
+        expected_run["base_workspace_id"] = "new-workspace".into();
+        expected_run["lead"]["harness"] = "codex".into();
+        expected_run["lead"]["model"] = "gpt-5.6-terra".into();
+        expected_run["lead"]["reasoning_effort"] = "high".into();
+        expected_run["lead"]["workspace_id"] = "new-workspace".into();
+        expected_run["lead"]["tab_id"] = "relaunched-tab".into();
+        expected_run["lead"]["pane_id"] = "relaunched-pane".into();
+    }
+    assert_eq!(project["runs"]["run-active"], expected_run);
 }
 
 #[test]
@@ -403,6 +629,16 @@ fn reports_missing_config_when_neither_project_nor_global_config_exists() {
     assert!(!validation.status.success());
     let error: serde_json::Value = serde_json::from_slice(&validation.stderr).unwrap();
     assert!(error["error"].as_str().unwrap().contains("not enabled"));
+}
+
+#[test]
+fn action_start_persists_pruning_before_focusing_a_live_lead() {
+    run_start_prune_fixture(true);
+}
+
+#[test]
+fn action_start_persists_pruning_before_relaunching_a_missing_lead() {
+    run_start_prune_fixture(false);
 }
 
 #[test]

@@ -90,12 +90,11 @@ impl App {
                     active_run: None,
                     runs: Default::default(),
                 });
-            if let Some(run) = project
-                .active_run
-                .as_ref()
-                .and_then(|id| project.runs.get(id))
-                .filter(|run| run.status == RunStatus::Active)
+            if let Some(run_id) = project.active_run.clone()
+                && let Some(run) = project.runs.get_mut(&run_id)
+                && run.status == RunStatus::Active
             {
+                prune_integrated_agents(run);
                 return Ok(run.clone());
             }
             project.active_run = None;
@@ -1385,6 +1384,42 @@ fn agent_has_pending_work(agent: &Agent) -> bool {
     )
 }
 
+fn prune_integrated_agents(run: &mut Run) {
+    let has_resumable_shared_checkout_agent = run
+        .agents
+        .values()
+        .any(|agent| agent.status != AgentStatus::Integrated && !agent.use_worktree);
+
+    run.agents.retain(|_, agent| {
+        let safely_cleaned = agent.status == AgentStatus::Integrated
+            && agent.workspace_id.is_none()
+            && agent.tab_id.is_none()
+            && agent.pane_id.is_none()
+            && agent.checkout_path.is_none()
+            && agent.cleanup_attempts == 0
+            && agent.error.is_none();
+        if !safely_cleaned {
+            return true;
+        }
+
+        if !has_resumable_shared_checkout_agent {
+            return false;
+        }
+
+        // These fields mirror complete_agent's shared-checkout attribution:
+        // claimed_commits is authoritative, while report.commit_sha is the
+        // legacy fallback when claims are absent. Retain either record while
+        // an unfinished shared-checkout agent can still need that evidence.
+        !agent.claimed_commits.is_empty()
+            || (!agent.use_worktree
+                && agent
+                    .report
+                    .as_ref()
+                    .and_then(|report| report.commit_sha.as_ref())
+                    .is_some())
+    });
+}
+
 fn agent_mut<'a>(run: &'a mut Run, agent_id: &str) -> Result<&'a mut Agent> {
     run.agents.get_mut(agent_id).context("unknown agent")
 }
@@ -1519,9 +1554,56 @@ mod tests {
 
     use super::{
         configured_agent_launch_args, display_role, is_runner_availability_failure,
-        next_cleanup_attempt, yolo_agent_args,
+        next_cleanup_attempt, prune_integrated_agents, yolo_agent_args,
     };
     use crate::config::Harness;
+    use crate::model::{Agent, AgentStatus, Run};
+
+    fn agent(status: AgentStatus) -> Agent {
+        serde_json::from_value(serde_json::json!({
+            "id": "agent-1",
+            "title": "Test agent",
+            "task": "Test pruning",
+            "scope": ["src"],
+            "acceptance": ["Tests pass"],
+            "harness": "codex",
+            "branch": "main",
+            "base_sha": "base",
+            "agent_name": "cadence-test-a1",
+            "status": status,
+            "use_worktree": false
+        }))
+        .unwrap()
+    }
+
+    fn run<I, S>(agents: I) -> Run
+    where
+        I: IntoIterator<Item = (S, Agent)>,
+        S: Into<String>,
+    {
+        Run {
+            id: "run-test".into(),
+            status: crate::model::RunStatus::Active,
+            base_branch: "main".into(),
+            base_workspace_id: "workspace".into(),
+            lead: crate::model::AgentRef {
+                name: "cadence-lead-test".into(),
+                harness: Harness::Codex,
+                model: None,
+                reasoning_effort: Default::default(),
+                workspace_id: None,
+                tab_id: None,
+                pane_id: None,
+            },
+            created_unix_ms: 1,
+            next_agent: 1,
+            agents: agents
+                .into_iter()
+                .map(|(id, agent)| (id.into(), agent))
+                .collect(),
+            last_error: None,
+        }
+    }
 
     #[test]
     fn formats_agent_roles_for_labels() {
@@ -1578,5 +1660,144 @@ mod tests {
         assert_eq!(next_cleanup_attempt(0).unwrap(), 1);
         assert_eq!(next_cleanup_attempt(1).unwrap(), 2);
         assert!(next_cleanup_attempt(2).is_err());
+    }
+
+    #[test]
+    fn prunes_only_safe_integrated_history_and_preserves_recovery_evidence() {
+        let statuses = [
+            AgentStatus::Starting,
+            AgentStatus::Working,
+            AgentStatus::Blocked,
+            AgentStatus::Failed,
+            AgentStatus::Cancelled,
+            AgentStatus::Completed,
+            AgentStatus::Integrating,
+            AgentStatus::Conflict,
+        ];
+        let mut agents = statuses
+            .iter()
+            .enumerate()
+            .map(|(index, status)| {
+                let mut agent = agent(status.clone());
+                agent.id = format!("status-{index}");
+                (agent.id.clone(), agent)
+            })
+            .collect::<Vec<_>>();
+        let mut clean = agent(AgentStatus::Integrated);
+        clean.id = "clean".into();
+        agents.push((clean.id.clone(), clean));
+        for (name, field) in [
+            ("workspace", "workspace_id"),
+            ("tab", "tab_id"),
+            ("pane", "pane_id"),
+            ("checkout", "checkout_path"),
+        ] {
+            let mut retained = agent(AgentStatus::Integrated);
+            retained.id = name.into();
+            let value = serde_json::json!("retained");
+            match field {
+                "workspace_id" => retained.workspace_id = Some(value.as_str().unwrap().into()),
+                "tab_id" => retained.tab_id = Some(value.as_str().unwrap().into()),
+                "pane_id" => retained.pane_id = Some(value.as_str().unwrap().into()),
+                "checkout_path" => retained.checkout_path = Some(value.as_str().unwrap().into()),
+                _ => unreachable!(),
+            }
+            agents.push((retained.id.clone(), retained));
+        }
+        let mut attempts = agent(AgentStatus::Integrated);
+        attempts.id = "attempts".into();
+        attempts.cleanup_attempts = 1;
+        agents.push((attempts.id.clone(), attempts));
+        let mut errored = agent(AgentStatus::Integrated);
+        errored.id = "error".into();
+        errored.error = Some("cleanup failed".into());
+        agents.push((errored.id.clone(), errored));
+
+        let original = run(agents);
+        let mut pruned = original.clone();
+        prune_integrated_agents(&mut pruned);
+
+        assert!(!pruned.agents.contains_key("clean"));
+        for (id, expected) in original
+            .agents
+            .iter()
+            .filter(|(id, _)| id.as_str() != "clean")
+        {
+            assert_eq!(
+                serde_json::to_value(pruned.agents.get(id)).unwrap(),
+                serde_json::to_value(Some(expected)).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_shared_checkout_attribution_only_while_work_can_resume() {
+        let mut claimed = agent(AgentStatus::Integrated);
+        claimed.id = "claimed".into();
+        claimed.claimed_commits = vec!["commit-1".into()];
+        let mut legacy = agent(AgentStatus::Integrated);
+        legacy.id = "legacy".into();
+        legacy.report = Some(crate::model::AgentReport {
+            status: crate::model::ReportStatus::Completed,
+            summary: "done".into(),
+            tests: Vec::new(),
+            changed_paths: Vec::new(),
+            blockers: Vec::new(),
+            commit_sha: Some("commit-2".into()),
+        });
+        let mut unfinished = agent(AgentStatus::Failed);
+        unfinished.id = "unfinished".into();
+        let mut anomalous = agent(AgentStatus::Integrated);
+        anomalous.id = "anomalous".into();
+        anomalous.use_worktree = true;
+        anomalous.claimed_commits = vec!["anomalous-commit".into()];
+        let mut resumable = run(vec![
+            ("claimed", claimed.clone()),
+            ("legacy", legacy.clone()),
+            ("unfinished", unfinished.clone()),
+            ("anomalous", anomalous.clone()),
+        ]);
+        prune_integrated_agents(&mut resumable);
+        assert!(resumable.agents.contains_key("claimed"));
+        assert!(resumable.agents.contains_key("legacy"));
+        assert!(resumable.agents.contains_key("unfinished"));
+        assert!(resumable.agents.contains_key("anomalous"));
+
+        let mut no_shared = run(vec![
+            ("claimed", claimed),
+            ("legacy", legacy),
+            ("unfinished", {
+                unfinished.use_worktree = true;
+                unfinished
+            }),
+            ("anomalous", anomalous),
+        ]);
+        prune_integrated_agents(&mut no_shared);
+        assert!(!no_shared.agents.contains_key("claimed"));
+        assert!(!no_shared.agents.contains_key("legacy"));
+        assert!(no_shared.agents.contains_key("unfinished"));
+        assert!(!no_shared.agents.contains_key("anomalous"));
+
+        let mut empty_claims = agent(AgentStatus::Integrated);
+        empty_claims.id = "empty-claims".into();
+        empty_claims.use_worktree = true;
+        empty_claims.report = Some(crate::model::AgentReport {
+            status: crate::model::ReportStatus::Completed,
+            summary: "worktree done".into(),
+            tests: Vec::new(),
+            changed_paths: Vec::new(),
+            blockers: Vec::new(),
+            commit_sha: Some("worktree-commit".into()),
+        });
+        let mut worktree_only = run(vec![
+            ("attribution", empty_claims),
+            ("unfinished", {
+                let mut agent = agent(AgentStatus::Cancelled);
+                agent.use_worktree = true;
+                agent
+            }),
+        ]);
+        prune_integrated_agents(&mut worktree_only);
+        assert!(!worktree_only.agents.contains_key("attribution"));
     }
 }
