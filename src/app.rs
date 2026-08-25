@@ -158,23 +158,26 @@ impl App {
             stored.lead.pane_id = Some(terminal.pane_id.clone());
             Ok(())
         })?;
-        let agent_args = yolo_agent_args(run.lead.harness, config.yolo);
-        let launch = if run.lead.harness == Harness::Codex {
+        let lead_harness = config.lead.harness;
+        let lead_model = config.lead.model.as_deref();
+        let lead_reasoning_effort = config.lead.reasoning_effort;
+        let agent_args = yolo_agent_args(lead_harness, config.yolo);
+        let launch = if lead_harness == Harness::Codex {
             self.herdr.start_codex_lead(
                 &run.lead.name,
                 &terminal.pane_id,
-                run.lead.model.as_deref(),
-                run.lead.reasoning_effort,
+                lead_model,
+                lead_reasoning_effort,
                 &agent_args,
                 &self.binary,
             )
         } else {
             self.herdr.start_agent(
                 &run.lead.name,
-                run.lead.harness,
+                lead_harness,
                 &terminal.pane_id,
-                run.lead.model.as_deref(),
-                run.lead.reasoning_effort,
+                lead_model,
+                lead_reasoning_effort,
                 &agent_args,
             )
         };
@@ -182,6 +185,13 @@ impl App {
             self.set_run_error(&key, &run.id, &error.to_string())?;
             return Err(error.context("failed to start the Lead"));
         }
+        self.state.update(|store| {
+            let stored = active_run_mut(store, &key)?;
+            stored.lead.harness = lead_harness;
+            stored.lead.model = config.lead.model.clone();
+            stored.lead.reasoning_effort = lead_reasoning_effort;
+            Ok(())
+        })?;
         let prompt = prompts::lead(
             &self.binary,
             self.state.dir(),

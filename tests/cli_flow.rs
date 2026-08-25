@@ -556,6 +556,11 @@ fn keeps_claude_lead_instructions_as_a_post_launch_prompt() {
 }
 
 #[test]
+fn relaunches_lead_from_current_config_and_refreshes_persisted_settings() {
+    run_agent_flow_with_relaunch();
+}
+
+#[test]
 fn starts_dirty_but_blocks_agents_until_clean() {
     run_agent_flow(true, false, true, false, false, false);
 }
@@ -598,6 +603,63 @@ fn run_agent_flow_with_lead(
     force_tab_cleanup_retry: bool,
     lead_harness: herdr_cadence::config::Harness,
 ) {
+    run_agent_flow_with_lead_options(
+        use_worktree,
+        global_yolo,
+        dirty_at_start,
+        create_out_of_scope_commit,
+        force_primary_credit_failure,
+        force_tab_cleanup_retry,
+        LeadFlowSettings {
+            lead_harness,
+            relaunch_lead: None,
+        },
+    );
+}
+
+fn run_agent_flow_with_relaunch() {
+    run_agent_flow_with_lead_options(
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        LeadFlowSettings {
+            lead_harness: herdr_cadence::config::Harness::Codex,
+            relaunch_lead: Some((
+                herdr_cadence::config::Harness::Opencode,
+                "openai/relaunch-model".into(),
+                herdr_cadence::config::ReasoningEffort::Low,
+                true,
+            )),
+        },
+    );
+}
+
+struct LeadFlowSettings {
+    lead_harness: herdr_cadence::config::Harness,
+    relaunch_lead: Option<(
+        herdr_cadence::config::Harness,
+        String,
+        herdr_cadence::config::ReasoningEffort,
+        bool,
+    )>,
+}
+
+fn run_agent_flow_with_lead_options(
+    use_worktree: bool,
+    global_yolo: bool,
+    dirty_at_start: bool,
+    create_out_of_scope_commit: bool,
+    force_primary_credit_failure: bool,
+    force_tab_cleanup_retry: bool,
+    settings: LeadFlowSettings,
+) {
+    let LeadFlowSettings {
+        lead_harness,
+        relaunch_lead,
+    } = settings;
     let repo = repo();
     let state = tempfile::tempdir().unwrap();
     assert!(
@@ -800,6 +862,18 @@ fi
     let run = &project["runs"][active_run];
     assert_eq!(run["base_workspace_id"], "base-ws");
     assert_eq!(run["lead"]["workspace_id"], "base-ws");
+    let initial_run_id = active_run.to_string();
+    let initial_lead_name = run["lead"]["name"].as_str().unwrap().to_string();
+    if let Some((harness, model, reasoning_effort, yolo)) = relaunch_lead.as_ref() {
+        config.lead.harness = *harness;
+        config.lead.model = Some(model.clone());
+        config.lead.reasoning_effort = *reasoning_effort;
+        config.yolo = *yolo;
+        config.validate().unwrap();
+        fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+        git(repo.path(), &["add", ".cadence.toml"]);
+        git(repo.path(), &["commit", "-m", "update Lead config"]);
+    }
     let resumed = Command::new(env!("CARGO_BIN_EXE_herdr-cadence"))
         .args([
             "--state-dir",
@@ -820,7 +894,23 @@ fi
     );
     let resumed: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
     assert_eq!(resumed["status"], "focused");
+    if relaunch_lead.is_some() {
+        let focused_store: serde_json::Value =
+            serde_json::from_slice(&fs::read(state.path().join("state.json")).unwrap()).unwrap();
+        let focused_project = focused_store["projects"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        let focused_run = &focused_project["runs"][&initial_run_id];
+        assert_eq!(focused_run["lead"]["name"], initial_lead_name);
+        assert_eq!(focused_run["lead"]["harness"], "codex");
+        assert_eq!(focused_run["lead"]["model"], "openai/lead-model");
+        assert_eq!(focused_run["lead"]["reasoning_effort"], "high");
+    }
 
+    let calls_before_relaunch = fs::read_to_string(&log).unwrap();
     fs::remove_file(&lead_started).unwrap();
     let restarted = Command::new(env!("CARGO_BIN_EXE_herdr-cadence"))
         .args([
@@ -842,6 +932,39 @@ fi
     );
     let calls = fs::read_to_string(&log).unwrap();
     assert!(calls.contains("tab create --workspace resumed-ws"));
+    if let Some((harness, model, reasoning_effort, yolo)) = relaunch_lead.as_ref() {
+        let relaunch_calls = &calls[calls_before_relaunch.len()..];
+        let expected_launch = match harness {
+            herdr_cadence::config::Harness::Claude => format!(
+                "--kind claude --pane pane-lead --timeout 120000 -- --model {model} --effort {}",
+                reasoning_effort.as_str().unwrap()
+            ),
+            herdr_cadence::config::Harness::Codex => format!(
+                "--kind codex --pane pane-lead --timeout 120000 -- --model {model} --config model_reasoning_effort=\"{}\"",
+                reasoning_effort.as_str().unwrap()
+            ),
+            herdr_cadence::config::Harness::Opencode => format!(
+                "--kind opencode --pane pane-lead --timeout 120000 -- --model {model}#{}",
+                reasoning_effort.as_str().unwrap()
+            ),
+        };
+        assert!(relaunch_calls.contains(&expected_launch));
+        assert!(!relaunch_calls.contains("openai/lead-model"));
+        if *yolo {
+            let yolo_arg = match harness {
+                herdr_cadence::config::Harness::Claude => "--dangerously-skip-permissions",
+                herdr_cadence::config::Harness::Codex => {
+                    "--dangerously-bypass-approvals-and-sandbox"
+                }
+                herdr_cadence::config::Harness::Opencode => "--auto",
+            };
+            assert!(relaunch_calls.contains(yolo_arg));
+        }
+        if *harness != herdr_cadence::config::Harness::Codex {
+            assert!(!relaunch_calls.contains("hooks.SessionStart"));
+            assert!(!relaunch_calls.contains("hooks.state="));
+        }
+    }
     let store: serde_json::Value =
         serde_json::from_slice(&fs::read(state.path().join("state.json")).unwrap()).unwrap();
     let project = store["projects"]
@@ -851,6 +974,25 @@ fi
         .next()
         .unwrap();
     let active_run = project["active_run"].as_str().unwrap();
+    assert_eq!(active_run, initial_run_id);
+    assert_eq!(
+        project["runs"][active_run]["lead"]["name"],
+        initial_lead_name
+    );
+    if let Some((harness, model, reasoning_effort, _)) = relaunch_lead.as_ref() {
+        assert_eq!(
+            project["runs"][active_run]["lead"]["harness"],
+            harness.as_str()
+        );
+        assert_eq!(project["runs"][active_run]["lead"]["model"], model.as_str());
+        assert_eq!(
+            project["runs"][active_run]["lead"]["reasoning_effort"],
+            reasoning_effort.as_str().unwrap()
+        );
+    }
+    let agent_yolo = relaunch_lead
+        .as_ref()
+        .map_or(global_yolo, |(_, _, _, yolo)| *yolo);
     assert_eq!(
         project["runs"][active_run]["base_workspace_id"],
         "resumed-ws"
@@ -1045,7 +1187,7 @@ fi
     if force_primary_credit_failure {
         assert!(calls.contains("provider is unavailable; retrying with fallback qa-backup"));
     }
-    if global_yolo {
+    if agent_yolo {
         assert!(calls.contains(&format!(
             "{selected_launch} --dangerously-bypass-approvals-and-sandbox"
         )));
