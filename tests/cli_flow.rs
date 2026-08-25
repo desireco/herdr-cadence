@@ -141,6 +141,51 @@ fn start_prune_fixture(
                 "agent_name": "cadence-current-working",
                 "status": "working"
             },
+            "resumable": {
+                "id": "resumable",
+                "title": "Resumable shared-checkout agent",
+                "task": "Current shared-checkout task",
+                "scope": ["src/shared"],
+                "acceptance": ["Task is complete"],
+                "harness": "codex",
+                "use_worktree": false,
+                "branch": "main",
+                "base_sha": "base",
+                "agent_name": "cadence-current-resumable",
+                "status": "working"
+            },
+            "claimed": {
+                "id": "claimed",
+                "title": "Claimed integrated agent",
+                "task": "Finished task with claimed commits",
+                "scope": ["src/claimed"],
+                "acceptance": ["Task is complete"],
+                "harness": "codex",
+                "use_worktree": false,
+                "branch": "main",
+                "base_sha": "base",
+                "claimed_commits": ["claimed-commit"],
+                "agent_name": "cadence-old-claimed",
+                "status": "integrated"
+            },
+            "legacy": {
+                "id": "legacy",
+                "title": "Legacy integrated agent",
+                "task": "Finished task with legacy attribution",
+                "scope": ["src/legacy"],
+                "acceptance": ["Task is complete"],
+                "harness": "codex",
+                "use_worktree": false,
+                "branch": "main",
+                "base_sha": "base",
+                "agent_name": "cadence-old-legacy",
+                "status": "integrated",
+                "report": {
+                    "status": "completed",
+                    "summary": "Finished task",
+                    "commit_sha": "legacy-commit"
+                }
+            },
             "retained": {
                 "id": "retained",
                 "title": "Retained integrated agent",
@@ -292,6 +337,15 @@ fn run_start_prune_fixture(live_lead: bool) {
         .as_object_mut()
         .unwrap()
         .remove("clean");
+    let agents = project["runs"]["run-active"]["agents"].as_object().unwrap();
+    assert_eq!(agents["resumable"]["status"], "working");
+    assert_eq!(agents["resumable"]["use_worktree"], false);
+    assert_eq!(
+        agents["claimed"]["claimed_commits"],
+        json!(["claimed-commit"])
+    );
+    assert_eq!(agents["legacy"]["report"]["commit_sha"], "legacy-commit");
+    assert!(!agents.contains_key("clean"));
     if !live_lead {
         expected_run["base_workspace_id"] = "new-workspace".into();
         expected_run["lead"]["harness"] = "codex".into();
