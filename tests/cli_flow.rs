@@ -80,6 +80,67 @@ fn cadence_with_config_dir(root: &Path, state: &Path, config_dir: &Path, args: &
         .unwrap()
 }
 
+fn write_agent_cancel_fixture(
+    repo: &Path,
+    state: &Path,
+    agents: serde_json::Map<String, serde_json::Value>,
+) {
+    let key = herdr_cadence::state::project_key(repo);
+    let store = json!({
+        "schema_version": 1,
+        "projects": {
+            key: {
+                "root": repo.display().to_string(),
+                "active_run": "run-cancel",
+                "runs": {
+                    "run-cancel": {
+                        "id": "run-cancel",
+                        "status": "active",
+                        "base_branch": "main",
+                        "base_workspace_id": "base-workspace",
+                        "lead": {
+                            "name": "cadence-lead-cancel",
+                            "harness": "codex"
+                        },
+                        "created_unix_ms": 1,
+                        "next_agent": 1,
+                        "agents": agents
+                    }
+                }
+            }
+        }
+    });
+    fs::write(
+        state.join("state.json"),
+        serde_json::to_vec_pretty(&store).unwrap(),
+    )
+    .unwrap();
+}
+
+fn cancel_agent_json(
+    repo: &Path,
+    state: &Path,
+    fake: &Path,
+    agent_id: &str,
+    force: bool,
+) -> Output {
+    let mut args = vec!["agent", "cancel", agent_id];
+    if force {
+        args.push("--force");
+    }
+    Command::new(env!("CARGO_BIN_EXE_herdr-cadence"))
+        .args([
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--project-root",
+            repo.to_str().unwrap(),
+        ])
+        .args(args)
+        .env("HERDR_BIN_PATH", fake)
+        .output()
+        .unwrap()
+}
+
 fn start_prune_fixture(
     repo: &Path,
     state: &Path,
@@ -817,6 +878,210 @@ fn codex_compact_hook_emits_session_start_context_json() {
     assert!(context.contains("only you talk to the user"));
     assert!(context.contains("agent spawn"));
     assert!(context.contains("run finish only when the user asks"));
+    assert!(context.contains("Cadence Agent.status is authoritative"));
+    assert!(context.contains("observed_agent_status is advisory"));
+    assert!(context.contains("must never alone trigger cancellation"));
+    assert!(context.contains(
+        "explicit user intent or verified nonresponse after repeated transcript/progress checks"
+    ));
+}
+
+#[test]
+fn agent_cancel_requires_force_and_preserves_cancellation_lifecycle_rules() {
+    let repo = repo();
+    let state = tempfile::tempdir().unwrap();
+    let fake_dir = tempfile::tempdir().unwrap();
+    let fake = fake_dir.path().join("herdr");
+    let log = fake_dir.path().join("calls.log");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+        log.display()
+    );
+    fs::write(&fake, script).unwrap();
+    let mut permissions = fs::metadata(&fake).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake, permissions).unwrap();
+
+    let statuses = [
+        ("starting", "starting", "working"),
+        ("working", "working", "idle"),
+        ("blocked", "blocked", "blocked"),
+        ("completed", "completed", "done"),
+        ("conflict", "conflict", "idle"),
+        ("integrating", "integrating", "working"),
+        ("integrated", "integrated", "idle"),
+        ("failed", "failed", "unknown"),
+        ("cancelled", "cancelled", "done"),
+    ];
+    let agents = statuses
+        .iter()
+        .map(|(id, status, observed)| {
+            (
+                (*id).to_string(),
+                json!({
+                    "id": id,
+                    "title": id,
+                    "task": "Test cancellation",
+                    "scope": ["src"],
+                    "acceptance": ["Tests pass"],
+                    "harness": "codex",
+                    "branch": "main",
+                    "base_sha": "base",
+                    "agent_name": format!("cadence-cancel-{id}"),
+                    "status": status,
+                    "observed_agent_status": observed,
+                    "use_worktree": false,
+                    "pane_id": format!("pane-{id}"),
+                    "tab_id": format!("tab-{id}")
+                }),
+            )
+        })
+        .collect();
+    write_agent_cancel_fixture(repo.path(), state.path(), agents);
+
+    let before = fs::read(state.path().join("state.json")).unwrap();
+    for (id, status, observed) in statuses.iter().take(5) {
+        let refused = cancel_agent_json(repo.path(), state.path(), &fake, id, false);
+        assert!(!refused.status.success());
+        let error: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
+        let message = error["error"].as_str().unwrap();
+        assert!(message.contains("without `--force`"), "{message}");
+        assert!(
+            message.contains(&format!("lifecycle status is `{status}`")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("observed status is `{observed}`")),
+            "{message}"
+        );
+    }
+    assert_eq!(fs::read(state.path().join("state.json")).unwrap(), before);
+    assert!(!log.exists(), "no-force cancellation must not call Herdr");
+
+    for id in ["starting", "working", "blocked", "completed", "conflict"] {
+        let forced = cancel_agent_json(repo.path(), state.path(), &fake, id, true);
+        assert!(
+            forced.status.success(),
+            "{}",
+            String::from_utf8_lossy(&forced.stderr)
+        );
+        let forced: serde_json::Value = serde_json::from_slice(&forced.stdout).unwrap();
+        assert_eq!(forced["status"], "cancelled");
+        if matches!(id, "completed" | "conflict") {
+            assert_eq!(forced["pane_id"], format!("pane-{id}"));
+            assert_eq!(forced["tab_id"], format!("tab-{id}"));
+        }
+    }
+    let calls_after_force = fs::read_to_string(&log).unwrap();
+    assert!(calls_after_force.contains("agent send-keys cadence-cancel-starting ctrl+c"));
+    assert!(calls_after_force.contains("agent get cadence-cancel-working"));
+    assert!(calls_after_force.contains("agent send-keys cadence-cancel-working ctrl+c"));
+    assert!(calls_after_force.contains("agent send-keys cadence-cancel-blocked ctrl+c"));
+    assert!(calls_after_force.contains("agent send-keys cadence-cancel-completed ctrl+c"));
+    assert!(calls_after_force.contains("agent send-keys cadence-cancel-conflict ctrl+c"));
+
+    for (id, status, observed) in statuses.iter().skip(5) {
+        let before_terminal = fs::read(state.path().join("state.json")).unwrap();
+        let calls_before_terminal = fs::read_to_string(&log).unwrap();
+        let refused = cancel_agent_json(repo.path(), state.path(), &fake, id, true);
+        assert!(!refused.status.success());
+        let error: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
+        let message = error["error"].as_str().unwrap();
+        assert!(
+            message.contains(&format!("lifecycle status is `{status}`")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("observed status is `{observed}`")),
+            "{message}"
+        );
+        assert!(
+            message.contains("only Starting, Working, Blocked, Completed, or Conflict"),
+            "{message}"
+        );
+        assert_eq!(
+            fs::read(state.path().join("state.json")).unwrap(),
+            before_terminal
+        );
+        assert_eq!(fs::read_to_string(&log).unwrap(), calls_before_terminal);
+    }
+}
+
+#[test]
+fn agent_idle_notification_is_advisory_and_keeps_working_lifecycle() {
+    let repo = repo();
+    let state = tempfile::tempdir().unwrap();
+    assert!(
+        cadence(repo.path(), state.path(), &["action", "init"])
+            .status
+            .success()
+    );
+    let fake_dir = tempfile::tempdir().unwrap();
+    let fake = fake_dir.path().join("herdr");
+    let log = fake_dir.path().join("calls.log");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+        log.display()
+    );
+    fs::write(&fake, script).unwrap();
+    let mut permissions = fs::metadata(&fake).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake, permissions).unwrap();
+    write_agent_cancel_fixture(
+        repo.path(),
+        state.path(),
+        [(
+            "working".into(),
+            json!({
+                "id": "working",
+                "title": "Working agent",
+                "task": "Test idle observation",
+                "scope": ["src"],
+                "acceptance": ["Tests pass"],
+                "harness": "codex",
+                "branch": "main",
+                "base_sha": "base",
+                "agent_name": "cadence-cancel-working",
+                "status": "working",
+                "pane_id": "pane-working",
+                "use_worktree": false
+            }),
+        )]
+        .into_iter()
+        .collect(),
+    );
+
+    let event = Command::new(env!("CARGO_BIN_EXE_herdr-cadence"))
+        .args([
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "--project-root",
+            repo.path().to_str().unwrap(),
+            "event",
+        ])
+        .env("HERDR_BIN_PATH", &fake)
+        .env("HERDR_PLUGIN_EVENT", "pane.agent_status_changed")
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"pane.agent_status_changed","data":{"pane_id":"pane-working","agent_status":"idle"}}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        event.status.success(),
+        "{}",
+        String::from_utf8_lossy(&event.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&event.stdout).unwrap();
+    assert_eq!(value["agent_id"], "working");
+    let status = cadence(repo.path(), state.path(), &["agent", "status", "working"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["status"], "working");
+    assert_eq!(status["observed_agent_status"], "idle");
+    let notification = fs::read_to_string(&log).unwrap();
+    assert!(notification.contains("lifecycle remains working"));
+    assert!(notification.contains("runtime observation is advisory"));
+    assert!(notification.contains("do not cancel solely from it"));
 }
 
 #[test]

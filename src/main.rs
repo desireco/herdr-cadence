@@ -95,6 +95,8 @@ enum AgentCommand {
     },
     Cancel {
         agent_id: String,
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -184,7 +186,7 @@ fn run() -> Result<()> {
                 agent_id,
                 prompt_file,
             } => app.prompt_agent(&agent_id, &prompt_file)?,
-            AgentCommand::Cancel { agent_id } => app.cancel_agent(&agent_id)?,
+            AgentCommand::Cancel { agent_id, force } => app.cancel_agent(&agent_id, force)?,
         },
     };
     println!("{}", serde_json::to_string_pretty(&value)?);

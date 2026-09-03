@@ -13,7 +13,7 @@ fn config_flag(config_dir: Option<&Path>) -> String {
 
 pub fn lead_compact(run_id: &str) -> String {
     format!(
-        "You remain Lead for Cadence run {run_id}; only you talk to the user. This is Codex compaction recovery. Retain the orchestration contract: coordinate delivery, delegate specialized or multi-step work through agent spawn with bounded non-overlapping scopes, and do trivial low-risk work directly. Manage agents with agent list/status/report/prompt/cancel/integrate, review reports, preserve failed or conflicted work, verify and commit each coherent change block, and preserve unrelated changes. Report results and stay available after tasks. Use run finish only when the user asks to end the session and no agents are active. Do not broaden the user's scope or let agents delegate."
+        "You remain Lead for Cadence run {run_id}; only you talk to the user. Codex compaction recovery: coordinate delivery, delegate specialized/multi-step work via bounded non-overlapping agent spawn, and do trivial low-risk work directly. Use agent list/status/report/prompt/cancel/integrate; review reports, preserve failed/conflicted work, verify and commit coherent blocks, and preserve unrelated changes. Cadence Agent.status is authoritative; observed_agent_status is advisory. Idle/done observations commonly occur between turns and must never alone trigger cancellation. Use agent cancel --force only for explicit user intent or verified nonresponse after repeated transcript/progress checks. Report results and stay available. Use run finish only when the user asks to end the session and no agents are active. Do not broaden scope or let agents delegate."
     )
 }
 
@@ -65,11 +65,11 @@ Coordinate delivery. Do trivial, low-risk work directly; delegate specialized, m
 Roles:
 {roles}
 
-Pick the best role; default to `{agent_default}`. Run at most {max} agents with non-overlapping repository-relative scopes. Scope entries are literal directory or file paths, never globs; a directory already covers everything under it. Include any shared-checkout root Markdown artifact in scope. Ordered runner fallback applies only to launch-time provider availability (credits, quota, rate limit, capacity, auth); a launched runner stays pinned. Retain failed/blocked resources and decide reassignment.
+Pick the best role; default to `{agent_default}`. Run at most {max} agents with non-overlapping repository-relative scopes. Scope paths are literal, never globs; directories cover everything under them. Include any shared-checkout root Markdown artifact in scope. Ordered runner fallback applies only to launch-time provider availability (credits, quota, rate limit, capacity, auth); a launched runner stays pinned. Retain failed/blocked resources and decide reassignment.
 
 Spawn with a JSON request containing title, task, scope, acceptance, and role:
   {bin} --state-dir {state}{config} --project-root {root} agent spawn --request-file <path>
-Manage with `agent list|status|report`, `agent prompt <id> --prompt-file <path>`, and `agent cancel <id>`. {integration_guidance}
+Manage with `agent list|status|report`, `agent prompt <id> --prompt-file <path>`, and `agent cancel <id> --force` only for explicit user intent or verified nonresponse after repeated transcript/progress checks. Cadence Agent.status is authoritative; observed_agent_status is advisory. Idle/done observations commonly occur between turns and must never alone trigger cancellation. {integration_guidance}
 
 For each coherent change block: verify, stage only task paths, and commit locally before continuing or reporting; this includes Lead and integrated agent work. Preserve unrelated changes; push only on request. Handle routine verification; ask the user only about material scope, destructive actions, or retained conflicts.
 
@@ -210,6 +210,13 @@ mod tests {
         // Agents inherit no HERDR_PLUGIN_CONFIG_DIR, so the invocations the
         // Lead is told to run must carry the directory explicitly.
         assert!(prompt.contains("--state-dir /state --config-dir /config"));
+        assert!(prompt.contains("Cadence Agent.status is authoritative"));
+        assert!(prompt.contains("observed_agent_status is advisory"));
+        assert!(prompt.contains("Idle/done observations commonly occur between turns"));
+        assert!(prompt.contains("must never alone trigger cancellation"));
+        assert!(prompt.contains(
+            "explicit user intent or verified nonresponse after repeated transcript/progress checks"
+        ));
     }
 
     #[test]
@@ -221,5 +228,12 @@ mod tests {
         assert!(prompt.contains("agent spawn"));
         assert!(prompt.contains("agent list/status/report/prompt/cancel/integrate"));
         assert!(prompt.contains("run finish only when the user asks"));
+        assert!(prompt.contains("Cadence Agent.status is authoritative"));
+        assert!(prompt.contains("observed_agent_status is advisory"));
+        assert!(prompt.contains("Idle/done observations commonly occur between turns"));
+        assert!(prompt.contains("must never alone trigger cancellation"));
+        assert!(prompt.contains(
+            "explicit user intent or verified nonresponse after repeated transcript/progress checks"
+        ));
     }
 }

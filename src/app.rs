@@ -758,10 +758,11 @@ impl App {
         self.agent_status(agent_id)
     }
 
-    pub fn cancel_agent(&self, agent_id: &str) -> Result<Value> {
+    pub fn cancel_agent(&self, agent_id: &str, force: bool) -> Result<Value> {
         let key = project_key(&self.root);
         let run = self.active_run_snapshot(&key)?;
         let agent = run.agents.get(agent_id).context("unknown agent")?;
+        ensure_agent_can_cancel(agent_id, force, agent)?;
         if self.herdr.agent_exists(&agent.agent_name) {
             self.herdr.send_ctrl_c(&agent.agent_name)?;
         }
@@ -946,7 +947,7 @@ impl App {
                     self.notify(
                         &key,
                         &format!(
-                            "{} is idle but has not submitted a completion report (internal ID: {agent_id}).",
+                            "{} observed {status} while its Cadence lifecycle remains working (internal ID: {agent_id}). This runtime observation is advisory; idle/done commonly occurs between turns, so do not cancel solely from it.",
                             agent_display_name(&agent)
                         ),
                     );
@@ -1546,6 +1547,41 @@ fn agent_display_name(agent: &Agent) -> String {
     format!("[{}] {}", display_role(&agent.role), agent.title)
 }
 
+fn lifecycle_status_name(status: &AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Starting => "starting",
+        AgentStatus::Working => "working",
+        AgentStatus::Blocked => "blocked",
+        AgentStatus::Failed => "failed",
+        AgentStatus::Cancelled => "cancelled",
+        AgentStatus::Completed => "completed",
+        AgentStatus::Integrating => "integrating",
+        AgentStatus::Integrated => "integrated",
+        AgentStatus::Conflict => "conflict",
+    }
+}
+
+fn ensure_agent_can_cancel(agent_id: &str, force: bool, agent: &Agent) -> Result<()> {
+    let lifecycle = lifecycle_status_name(&agent.status);
+    let observed = agent.observed_agent_status.as_deref().unwrap_or("unknown");
+    ensure!(
+        matches!(
+            agent.status,
+            AgentStatus::Starting
+                | AgentStatus::Working
+                | AgentStatus::Blocked
+                | AgentStatus::Completed
+                | AgentStatus::Conflict
+        ),
+        "cannot cancel agent {agent_id}: lifecycle status is `{lifecycle}`; observed status is `{observed}`; only Starting, Working, Blocked, Completed, or Conflict agents can be cancelled"
+    );
+    ensure!(
+        force,
+        "refusing to cancel agent {agent_id} without `--force`: lifecycle status is `{lifecycle}`; observed status is `{observed}`; idle/done observations are advisory and do not justify cancellation alone"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -1553,8 +1589,9 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        configured_agent_launch_args, display_role, is_runner_availability_failure,
-        next_cleanup_attempt, prune_integrated_agents, yolo_agent_args,
+        configured_agent_launch_args, display_role, ensure_agent_can_cancel,
+        is_runner_availability_failure, next_cleanup_attempt, prune_integrated_agents,
+        yolo_agent_args,
     };
     use crate::config::Harness;
     use crate::model::{Agent, AgentStatus, Run};
@@ -1610,6 +1647,50 @@ mod tests {
         assert_eq!(display_role("researcher"), "Researcher");
         assert_eq!(display_role("qa"), "QA");
         assert_eq!(display_role("docs_writer"), "Docs Writer");
+    }
+
+    #[test]
+    fn requires_force_for_cancellable_lifecycle_states_and_reports_observation() {
+        for (status, name) in [
+            (AgentStatus::Starting, "starting"),
+            (AgentStatus::Working, "working"),
+            (AgentStatus::Blocked, "blocked"),
+            (AgentStatus::Completed, "completed"),
+            (AgentStatus::Conflict, "conflict"),
+        ] {
+            let mut agent = agent(status);
+            agent.observed_agent_status = Some("idle".into());
+            let error = ensure_agent_can_cancel("agent-1", false, &agent).unwrap_err();
+            assert!(error.to_string().contains("without `--force`"));
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("lifecycle status is `{name}`"))
+            );
+            assert!(error.to_string().contains("observed status is `idle`"));
+            assert!(ensure_agent_can_cancel("agent-1", true, &agent).is_ok());
+        }
+    }
+
+    #[test]
+    fn rejects_review_and_terminal_lifecycle_states_even_with_force() {
+        for status in [
+            AgentStatus::Integrating,
+            AgentStatus::Integrated,
+            AgentStatus::Failed,
+            AgentStatus::Cancelled,
+        ] {
+            let mut agent = agent(status);
+            agent.observed_agent_status = Some("done".into());
+            let error = ensure_agent_can_cancel("agent-1", true, &agent).unwrap_err();
+            assert!(error.to_string().contains("lifecycle status"));
+            assert!(error.to_string().contains("observed status is `done`"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("only Starting, Working, Blocked, Completed, or Conflict")
+            );
+        }
     }
 
     #[test]
