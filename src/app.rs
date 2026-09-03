@@ -636,12 +636,13 @@ impl App {
         let key = project_key(&self.root);
         let run = self.active_run_snapshot(&key)?;
         let agent = run.agents.get(agent_id).context("unknown agent")?.clone();
-        ensure!(
-            matches!(agent.status, AgentStatus::Completed | AgentStatus::Conflict),
-            "Agent must have a completed report before integration"
-        );
         self.state.update(|store| {
-            agent_mut(active_run_mut(store, &key)?, agent_id)?.status = AgentStatus::Integrating;
+            let agent = agent_mut(active_run_mut(store, &key)?, agent_id)?;
+            ensure!(
+                matches!(agent.status, AgentStatus::Completed | AgentStatus::Conflict),
+                "Agent must have a completed report before integration"
+            );
+            agent.status = AgentStatus::Integrating;
             Ok(())
         })?;
         let result = (|| -> Result<()> {
@@ -760,13 +761,15 @@ impl App {
 
     pub fn cancel_agent(&self, agent_id: &str, force: bool) -> Result<Value> {
         let key = project_key(&self.root);
-        let run = self.active_run_snapshot(&key)?;
-        let agent = run.agents.get(agent_id).context("unknown agent")?;
-        ensure_agent_can_cancel(agent_id, force, agent)?;
-        if self.herdr.agent_exists(&agent.agent_name) {
-            self.herdr.send_ctrl_c(&agent.agent_name)?;
-        }
         self.state.update(|store| {
+            let agent_name = {
+                let agent = agent_mut(active_run_mut(store, &key)?, agent_id)?;
+                ensure_agent_can_cancel(agent_id, force, agent)?;
+                agent.agent_name.clone()
+            };
+            if self.herdr.agent_exists(&agent_name) {
+                self.herdr.send_ctrl_c(&agent_name)?;
+            }
             agent_mut(active_run_mut(store, &key)?, agent_id)?.status = AgentStatus::Cancelled;
             Ok(())
         })?;

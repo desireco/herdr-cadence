@@ -3,7 +3,9 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -139,6 +141,18 @@ fn cancel_agent_json(
         .env("HERDR_BIN_PATH", fake)
         .output()
         .unwrap()
+}
+
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn start_prune_fixture(
@@ -1005,6 +1019,265 @@ fn agent_cancel_requires_force_and_preserves_cancellation_lifecycle_rules() {
         );
         assert_eq!(fs::read_to_string(&log).unwrap(), calls_before_terminal);
     }
+}
+
+#[test]
+fn agent_cancel_and_integrate_are_serialized() {
+    let repo = repo();
+    let state = tempfile::tempdir().unwrap();
+    let initialized = cadence(repo.path(), state.path(), &["action", "init"]);
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    git(repo.path(), &["add", ".cadence.toml"]);
+    git(repo.path(), &["commit", "-m", "enable Cadence"]);
+
+    let fake_dir = tempfile::tempdir().unwrap();
+    let fake = fake_dir.path().join("herdr");
+    let cancel_started = fake_dir.path().join("cancel-started");
+    let cancel_release = fake_dir.path().join("cancel-release");
+    let calls = fake_dir.path().join("calls.log");
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1 $2" = "agent send-keys" ]; then
+  printf '%s\n' "$*" >> '{}'
+fi
+if [ "$1 $2" = "agent get" ] && [ "$3" = "cadence-cancel-race" ]; then
+  touch '{}'
+  while [ ! -e '{}' ]; do sleep 0.01; done
+fi
+exit 0
+"#,
+        calls.display(),
+        cancel_started.display(),
+        cancel_release.display()
+    );
+    fs::write(&fake, script).unwrap();
+    let mut permissions = fs::metadata(&fake).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake, permissions).unwrap();
+
+    write_agent_cancel_fixture(
+        repo.path(),
+        state.path(),
+        [(
+            "race".into(),
+            json!({
+                "id": "race",
+                "title": "Race agent",
+                "task": "Test cancellation serialization",
+                "scope": ["src"],
+                "acceptance": ["Tests pass"],
+                "harness": "codex",
+                "branch": "main",
+                "base_sha": "base",
+                "agent_name": "cadence-cancel-race",
+                "status": "completed",
+                "observed_agent_status": "done",
+                "use_worktree": false,
+                "pane_id": "pane-race",
+                "tab_id": "tab-race"
+            }),
+        )]
+        .into_iter()
+        .collect(),
+    );
+
+    let cancellation = Command::new(env!("CARGO_BIN_EXE_herdr-cadence"))
+        .args([
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "--project-root",
+            repo.path().to_str().unwrap(),
+            "agent",
+            "cancel",
+            "race",
+            "--force",
+        ])
+        .env("HERDR_BIN_PATH", &fake)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file(&cancel_started);
+
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state.path().join("state.lock"))
+        .unwrap();
+    assert!(
+        lock.try_lock_shared().is_err(),
+        "cancellation must hold the state lock during the Herdr call"
+    );
+
+    let integration = Command::new(env!("CARGO_BIN_EXE_herdr-cadence"))
+        .args([
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "--project-root",
+            repo.path().to_str().unwrap(),
+            "agent",
+            "integrate",
+            "race",
+        ])
+        .env("HERDR_BIN_PATH", &fake)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fs::write(&cancel_release, "release\n").unwrap();
+
+    let cancellation = cancellation.wait_with_output().unwrap();
+    assert!(
+        cancellation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cancellation.stderr)
+    );
+    let cancelled: serde_json::Value = serde_json::from_slice(&cancellation.stdout).unwrap();
+    assert_eq!(cancelled["status"], "cancelled");
+
+    let integration = integration.wait_with_output().unwrap();
+    assert!(!integration.status.success());
+    let integration_error: serde_json::Value = serde_json::from_slice(&integration.stderr).unwrap();
+    assert!(
+        integration_error["error"]
+            .as_str()
+            .unwrap()
+            .contains("completed report")
+    );
+    assert_eq!(
+        fs::read_to_string(&calls)
+            .unwrap()
+            .matches("agent send-keys cadence-cancel-race ctrl+c")
+            .count(),
+        1,
+        "only the cancellation that won may send Ctrl-C"
+    );
+
+    let integration_started = fake_dir.path().join("integration-started");
+    let integration_release = fake_dir.path().join("integration-release");
+    let git_dir = tempfile::tempdir().unwrap();
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("git"))
+        .find(|path| path.is_file())
+        .expect("git must be available for the CLI flow tests");
+    let git_wrapper = git_dir.path().join("git");
+    let git_script = format!(
+        r#"#!/bin/sh
+if [ "$1" = "-C" ] && [ "$3 $4" = "status --porcelain" ]; then
+  touch '{}'
+  while [ ! -e '{}' ]; do sleep 0.01; done
+fi
+exec '{}' "$@"
+"#,
+        integration_started.display(),
+        integration_release.display(),
+        real_git.display()
+    );
+    fs::write(&git_wrapper, git_script).unwrap();
+    let mut permissions = fs::metadata(&git_wrapper).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&git_wrapper, permissions).unwrap();
+
+    let integration_herdr = fake_dir.path().join("integration-herdr");
+    let integration_calls = fake_dir.path().join("integration-calls.log");
+    let integration_herdr_script = format!(
+        "#!/bin/sh\nif [ \"$1 $2\" = \"agent send-keys\" ]; then printf '%s\\n' \"$*\" >> '{}'; fi\nexit 0\n",
+        integration_calls.display()
+    );
+    fs::write(&integration_herdr, integration_herdr_script).unwrap();
+    let mut permissions = fs::metadata(&integration_herdr).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&integration_herdr, permissions).unwrap();
+
+    write_agent_cancel_fixture(
+        repo.path(),
+        state.path(),
+        [(
+            "race".into(),
+            json!({
+                "id": "race",
+                "title": "Race agent",
+                "task": "Test integration serialization",
+                "scope": ["src"],
+                "acceptance": ["Tests pass"],
+                "harness": "codex",
+                "branch": "main",
+                "base_sha": "base",
+                "agent_name": "cadence-cancel-race",
+                "status": "completed",
+                "observed_agent_status": "done",
+                "use_worktree": false,
+                "pane_id": "pane-race",
+                "tab_id": "tab-race"
+            }),
+        )]
+        .into_iter()
+        .collect(),
+    );
+
+    let integration = Command::new(env!("CARGO_BIN_EXE_herdr-cadence"))
+        .args([
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "--project-root",
+            repo.path().to_str().unwrap(),
+            "agent",
+            "integrate",
+            "race",
+        ])
+        .env("HERDR_BIN_PATH", &integration_herdr)
+        .env(
+            "PATH",
+            std::env::join_paths(
+                [git_dir.path().to_path_buf()]
+                    .into_iter()
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap(),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file(&integration_started);
+
+    let calls_before_cancel = fs::read_to_string(&integration_calls).unwrap_or_default();
+    let refused = cancel_agent_json(repo.path(), state.path(), &integration_herdr, "race", true);
+    assert!(!refused.status.success());
+    let refused_error: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert!(
+        refused_error["error"]
+            .as_str()
+            .unwrap()
+            .contains("lifecycle status is `integrating`")
+    );
+    assert_eq!(
+        fs::read_to_string(&integration_calls).unwrap_or_default(),
+        calls_before_cancel,
+        "cancellation must not call Herdr after integration enters Integrating"
+    );
+
+    fs::write(&integration_release, "release\n").unwrap();
+    let integration = integration.wait_with_output().unwrap();
+    assert!(
+        integration.status.success(),
+        "{}",
+        String::from_utf8_lossy(&integration.stderr)
+    );
+    let integrated: serde_json::Value = serde_json::from_slice(&integration.stdout).unwrap();
+    assert_eq!(integrated["status"], "integrated");
+    assert_eq!(
+        fs::read_to_string(&integration_calls)
+            .unwrap()
+            .matches("agent send-keys cadence-cancel-race ctrl+c")
+            .count(),
+        1,
+        "integration cleanup may send Ctrl-C only after it has won"
+    );
 }
 
 #[test]
