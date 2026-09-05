@@ -166,3 +166,56 @@ fn cleanup_preserves_edits_made_after_integration() {
         "new work\n"
     );
 }
+
+#[test]
+fn exits_preserve_reviewed_and_integrating_work() {
+    let fixture = Fixture::new();
+    for status in [
+        "completed",
+        "integrating",
+        "conflict",
+        "integrated",
+        "cancelled",
+        "failed",
+    ] {
+        fixture.edit_agent(|agent| agent["status"] = status.into());
+        let before = fixture.run(&["agent", "status", "agent-1"]);
+        success(
+            fixture
+                .command(&["event"])
+                .env("HERDR_PLUGIN_EVENT", "pane.exited")
+                .env("HERDR_PLUGIN_EVENT_JSON", r#"{"pane_id":"pane-agent"}"#)
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(fixture.run(&["agent", "status", "agent-1"]), before);
+    }
+    for status in ["starting", "working", "blocked"] {
+        fixture.edit_agent(|agent| agent["status"] = status.into());
+        success(
+            fixture
+                .command(&["event"])
+                .env("HERDR_PLUGIN_EVENT", "pane.exited")
+                .env("HERDR_PLUGIN_EVENT_JSON", r#"{"pane_id":"pane-agent"}"#)
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(
+            fixture.run(&["agent", "status", "agent-1"])["status"],
+            "failed"
+        );
+    }
+    fixture.edit_agent(|agent| agent["status"] = "completed".into());
+    success(
+        fixture
+            .command(&["event"])
+            .env("HERDR_PLUGIN_EVENT", "pane.exited")
+            .env("HERDR_PLUGIN_EVENT_JSON", r#"{"pane_id":"pane-agent"}"#)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        fixture.run(&["agent", "integrate", "agent-1"])["status"],
+        "integrated"
+    );
+}

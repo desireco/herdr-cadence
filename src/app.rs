@@ -963,10 +963,10 @@ impl App {
                     .unwrap_or(false);
                 let agent_missing = data.get("agent").is_none_or(Value::is_null);
                 if released || agent_missing {
-                    self.handle_agent_exit(&key, &run_id, &agent_id, &agent)?;
+                    self.handle_agent_exit(&key, &run_id, &agent_id)?;
                 }
             }
-            "pane.exited" => self.handle_agent_exit(&key, &run_id, &agent_id, &agent)?,
+            "pane.exited" => self.handle_agent_exit(&key, &run_id, &agent_id)?,
             _ => {}
         }
         Ok(json!({"handled": true, "agent_id": agent_id, "event": event_name}))
@@ -1008,7 +1008,7 @@ impl App {
                     continue;
                 }
                 if !agent_exists {
-                    self.handle_agent_exit(&key, &run_id, &agent.id, agent)?;
+                    self.handle_agent_exit(&key, &run_id, &agent.id)?;
                     reconciled += 1;
                 }
             }
@@ -1199,25 +1199,25 @@ impl App {
             .context("unknown project")
     }
 
-    fn handle_agent_exit(
-        &self,
-        key: &str,
-        run_id: &str,
-        agent_id: &str,
-        agent: &Agent,
-    ) -> Result<()> {
-        if agent.status != AgentStatus::Integrated && !agent.status.is_terminal() {
-            self.state.update(|store| {
-                let stored = agent_mut(run_mut(store, key, run_id)?, agent_id)?;
+    fn handle_agent_exit(&self, key: &str, run_id: &str, agent_id: &str) -> Result<()> {
+        let exited = self.state.update(|store| {
+            let stored = agent_mut(run_mut(store, key, run_id)?, agent_id)?;
+            if matches!(
+                stored.status,
+                AgentStatus::Starting | AgentStatus::Working | AgentStatus::Blocked
+            ) {
                 stored.status = AgentStatus::Failed;
                 stored.error = Some("agent exited without a terminal completion report".into());
-                Ok(())
-            })?;
+                return Ok(Some(agent_display_name(stored)));
+            }
+            Ok(None)
+        })?;
+        if let Some(display_name) = exited {
             self.notify(
                 key,
                 &format!(
                     "{} exited without completing (internal ID: {agent_id}); its changes and isolated resources were retained.",
-                    agent_display_name(agent)
+                    display_name
                 ),
             );
         }
