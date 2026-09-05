@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use herdr_cadence::app::{App, context_project_path, context_workspace_id};
-use herdr_cadence::prompts;
 
 #[derive(Parser)]
 #[command(name = "herdr-cadence", version, about)]
@@ -182,7 +181,7 @@ fn run() -> Result<()> {
                 serde_json::json!({
                     "hookSpecificOutput": {
                         "hookEventName": "SessionStart",
-                        "additionalContext": prompts::lead_compact(&run_id),
+                        "additionalContext": app.lead_compact_context(&run_id)?,
                     }
                 })
             }

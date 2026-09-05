@@ -142,7 +142,7 @@ impl App {
             let now = unix_ms();
             let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
             let id = format!("run-{nonce}-{}", &key[..8]);
-            let name = format!("cadence-lead-{}", &key[..8]);
+            let name = format!("cadence-lead-{id}");
             let run = Run {
                 id: id.clone(),
                 status: RunStatus::Active,
@@ -298,6 +298,23 @@ impl App {
             .herdr
             .show_notification("Cadence status", &notification);
         Ok(value)
+    }
+
+    pub fn lead_compact_context(&self, run_id: &str) -> Result<String> {
+        let key = project_key(&self.root);
+        let store = self.state.read()?;
+        let active = store.projects.get(&key).is_some_and(|project| {
+            project.active_run.as_deref() == Some(run_id)
+                && project
+                    .runs
+                    .get(run_id)
+                    .is_some_and(|run| run.status == RunStatus::Active)
+        });
+        if active {
+            Ok(prompts::lead_compact(run_id))
+        } else {
+            Ok(String::new())
+        }
     }
 
     pub fn validate_config(&self) -> Result<Value> {

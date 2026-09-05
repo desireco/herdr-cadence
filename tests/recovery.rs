@@ -614,3 +614,81 @@ fn in_flight_reports_cannot_write_into_a_replacement_run() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("run mismatch"));
     assert_eq!(fs::read(path).unwrap(), before);
 }
+
+#[test]
+fn a_new_run_launches_a_fresh_lead_and_keeps_the_old_session_inert() {
+    let fixture = Fixture::new();
+    fixture.edit_agent(|agent| agent["status"] = "cancelled".into());
+    fixture.run(&["run", "finish"]);
+    let log = fixture.dir.path().join("calls");
+    // The previous Lead is still alive. Only its exact name exists initially.
+    fixture.herdr(&format!(r#"printf '%s\n' "$*" >> '{}'
+if [ "$1 $2" = "agent get" ]; then
+  if [ "$3" = "cadence-lead" ] || [ -e '{}/'"$3" ]; then exit 0; fi
+  printf '%s\n' '{{"error":{{"code":"agent_not_found"}}}}' >&2
+  exit 1
+elif [ "$1 $2" = "tab create" ]; then
+  printf '%s\n' '{{"result":{{"tab":{{"tab_id":"fresh-tab"}},"root_pane":{{"pane_id":"fresh-pane"}}}}}}'
+elif [ "$1 $2" = "pane process-info" ]; then
+  printf '%s\n' '{{"result":{{"process_info":{{"shell_pid":1,"foreground_process_group_id":1}}}}}}'
+elif [ "$1 $2" = "agent start" ]; then
+  touch '{}/'"$3"
+fi
+exit 0
+"#, log.display(), fixture.dir.path().display(), fixture.dir.path().display()));
+    let started = success(
+        fixture
+            .command(&["action", "start"])
+            .env("HERDR_WORKSPACE_ID", "workspace-base")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(started["status"], "started");
+    assert_ne!(started["agent"], "cadence-lead");
+    let run_id = started["run_id"].as_str().unwrap();
+    let status = success(
+        fixture
+            .command(&["run", "status"])
+            .env("CADENCE_RUN_ID", run_id)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(status["active_run"]["lead"]["pane_id"], "fresh-pane");
+    assert_eq!(status["active_run"]["lead"]["tab_id"], "fresh-tab");
+    let calls = fs::read_to_string(&log).unwrap();
+    assert!(calls.contains(&format!("CADENCE_RUN_ID={run_id}")));
+    assert!(calls.contains(&format!("You are Lead for Cadence run {run_id}")));
+    assert!(!calls.contains("agent focus cadence-lead\n"));
+    let focused = success(
+        fixture
+            .command(&["action", "start"])
+            .env("HERDR_WORKSPACE_ID", "workspace-base")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(focused["status"], "focused");
+    assert_eq!(focused["agent"], started["agent"]);
+    let old_hook = fixture.run(&["hook", "codex-session-start"]);
+    assert_eq!(old_hook["hookSpecificOutput"]["additionalContext"], "");
+    let current_hook = success(
+        fixture
+            .command(&["hook", "codex-session-start"])
+            .env("CADENCE_RUN_ID", run_id)
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        current_hook["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains(run_id)
+    );
+    assert!(
+        !fixture
+            .command(&["run", "finish"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}

@@ -867,6 +867,7 @@ fn runs_every_agent_in_global_yolo() {
 fn codex_compact_hook_emits_session_start_context_json() {
     let repo = repo();
     let state = tempfile::tempdir().unwrap();
+    write_agent_cancel_fixture(repo.path(), state.path(), Default::default());
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-cadence"))
         .args([
             "--state-dir",
@@ -876,7 +877,7 @@ fn codex_compact_hook_emits_session_start_context_json() {
             "hook",
             "codex-session-start",
         ])
-        .env("CADENCE_RUN_ID", "run-hook-test")
+        .env("CADENCE_RUN_ID", "run-cancel")
         .output()
         .unwrap();
     assert!(
@@ -889,7 +890,7 @@ fn codex_compact_hook_emits_session_start_context_json() {
     let context = value["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap();
-    assert!(context.contains("Lead for Cadence run run-hook-test"));
+    assert!(context.contains("Lead for Cadence run run-cancel"));
     assert!(context.contains("only you talk to the user"));
     assert!(context.contains("agent spawn"));
     assert!(context.contains("run finish only when the user asks"));
