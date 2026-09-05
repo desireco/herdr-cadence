@@ -466,3 +466,69 @@ fn workspace_lookup_errors_retain_cleanup_resources() {
     assert_eq!(agent["workspace_id"], "workspace-agent");
     assert!(fixture.dir.path().join("checkout/file.txt").exists());
 }
+
+#[test]
+fn integrations_for_different_agents_cannot_overlap() {
+    let fixture = Fixture::new();
+    let root = fixture.dir.path();
+    let repo = root.join("repo");
+    let checkout = root.join("second-checkout");
+    let mut second = fixture.run(&["agent", "status", "agent-1"]);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "cadence/second",
+            checkout.to_str().unwrap(),
+            second["base_sha"].as_str().unwrap(),
+        ],
+    );
+    fs::write(checkout.join("second.txt"), "second\n").unwrap();
+    git(&checkout, &["add", "second.txt"]);
+    git(&checkout, &["commit", "-m", "second"]);
+    second["id"] = "agent-2".into();
+    second["agent_name"] = "cadence-second".into();
+    second["checkout_path"] = checkout.to_str().unwrap().into();
+    second["branch"] = "cadence/second".into();
+    second["scope"] = json!(["second.txt"]);
+    second["report"]["commit_sha"] = git(&checkout, &["rev-parse", "HEAD"]).into();
+    second["report"]["changed_paths"] = json!(["second.txt"]);
+    fixture.edit_run(|run| run["agents"]["agent-2"] = second);
+    let first = fixture
+        .command(&["agent", "integrate", "agent-1"])
+        .env("PATH", paused_git(&fixture))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file(&root.join("started"));
+    let blocked = fixture
+        .command(&["agent", "integrate", "agent-2"])
+        .output()
+        .unwrap();
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("another Cadence integration"));
+    assert_eq!(
+        fixture.run(&["agent", "status", "agent-2"])["status"],
+        "completed"
+    );
+    fs::write(root.join("release"), "go").unwrap();
+    assert_eq!(
+        success(first.wait_with_output().unwrap())["status"],
+        "integrated"
+    );
+    assert_eq!(
+        fixture.run(&["agent", "integrate", "agent-2"])["status"],
+        "integrated"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("file.txt")).unwrap(),
+        "reviewed\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("second.txt")).unwrap(),
+        "second\n"
+    );
+}

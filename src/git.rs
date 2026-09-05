@@ -1,7 +1,9 @@
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 
 fn git(root: &Path, args: &[&str]) -> Result<Output> {
     Command::new("git")
@@ -108,10 +110,48 @@ pub fn changed_paths_for_commit(root: &Path, commit: &str) -> Result<Vec<String>
     changed_paths(root, &format!("{commit}^"), commit)
 }
 
+pub fn lock_integration(root: &Path) -> Result<File> {
+    // The common Git directory also serializes callers using different state
+    // directories or different worktrees of this repository.
+    let common = root.join(checked(root, &["rev-parse", "--git-common-dir"])?);
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(common.join("cadence-integration.lock"))?;
+    lock.try_lock_exclusive()
+        .context("another Cadence integration is in progress; retry when it finishes")?;
+    Ok(lock)
+}
+
+fn git_path(root: &Path, name: &str) -> Result<PathBuf> {
+    Ok(root.join(checked(root, &["rev-parse", "--git-path", name])?))
+}
+
+fn ensure_no_git_operation(root: &Path) -> Result<()> {
+    for name in [
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "MERGE_HEAD",
+        "sequencer",
+        "rebase-merge",
+        "rebase-apply",
+    ] {
+        anyhow::ensure!(
+            !git_path(root, name)?.exists(),
+            "Git operation already in progress ({name}); refusing to start or abort a cherry-pick"
+        );
+    }
+    Ok(())
+}
+
 pub fn cherry_pick(root: &Path, commits: &[String]) -> Result<()> {
     if commits.is_empty() {
         bail!("Agent produced no commits");
     }
+    ensure_no_git_operation(root)?;
+    let original_head = head(root)?;
     let mut command = Command::new("git");
     command.arg("-C").arg(root).arg("cherry-pick").args(commits);
     let output = command.output()?;
@@ -119,8 +159,25 @@ pub fn cherry_pick(root: &Path, commits: &[String]) -> Result<()> {
         return Ok(());
     }
     let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let _ = git(root, &["cherry-pick", "--abort"]);
-    bail!("cherry-pick failed and was aborted: {message}")
+    let pick_head = git_path(root, "CHERRY_PICK_HEAD")?;
+    let sequence_head = git_path(root, "sequencer/head")?;
+    let owns_pick = pick_head.exists()
+        && commits
+            .iter()
+            .any(|commit| fs::read_to_string(&pick_head).is_ok_and(|head| head.trim() == commit));
+    let owns_sequence =
+        sequence_head.exists() && fs::read_to_string(sequence_head)?.trim() == original_head;
+    if owns_pick || owns_sequence {
+        let abort = git(root, &["cherry-pick", "--abort"])?;
+        if !abort.status.success() {
+            bail!(
+                "cherry-pick failed: {message}; abort also failed; Git state was retained: {}",
+                String::from_utf8_lossy(&abort.stderr).trim()
+            );
+        }
+        bail!("cherry-pick failed and was aborted: {message}");
+    }
+    bail!("cherry-pick failed: {message}; no owned operation was aborted")
 }
 
 pub fn delete_branch(root: &Path, branch: &str) -> Result<()> {
@@ -251,5 +308,51 @@ mod tests {
             head(repo.path()).unwrap()
         );
         assert!(resolve_commit(repo.path(), "--help").is_err());
+    }
+
+    #[test]
+    fn integration_lock_is_shared_across_worktrees_and_released_on_drop() {
+        let repo = repository();
+        let other = tempfile::tempdir().unwrap();
+        let checkout = other.path().join("checkout");
+        command(
+            repo.path(),
+            &["worktree", "add", "-b", "other", checkout.to_str().unwrap()],
+        );
+        let lock = lock_integration(repo.path()).unwrap();
+        assert!(lock_integration(&checkout).is_err());
+        drop(lock);
+        assert!(lock_integration(&checkout).is_ok());
+    }
+
+    #[test]
+    fn preserves_an_existing_cherry_pick() {
+        let repo = repository();
+        command(repo.path(), &["checkout", "-b", "agent"]);
+        fs::write(repo.path().join("file.txt"), "agent\n").unwrap();
+        command(repo.path(), &["commit", "-am", "agent"]);
+        let commit = head(repo.path()).unwrap();
+        command(repo.path(), &["checkout", "main"]);
+        fs::write(repo.path().join("file.txt"), "lead\n").unwrap();
+        command(repo.path(), &["commit", "-am", "lead"]);
+        assert!(
+            !git(repo.path(), &["cherry-pick", &commit])
+                .unwrap()
+                .status
+                .success()
+        );
+        let before_index = checked(repo.path(), &["ls-files", "--stage"]).unwrap();
+        let before_file = fs::read(repo.path().join("file.txt")).unwrap();
+        let error = cherry_pick(repo.path(), std::slice::from_ref(&commit)).unwrap_err();
+        assert!(error.to_string().contains("already in progress"));
+        assert_eq!(
+            checked(repo.path(), &["rev-parse", "CHERRY_PICK_HEAD"]).unwrap(),
+            commit
+        );
+        assert_eq!(
+            checked(repo.path(), &["ls-files", "--stage"]).unwrap(),
+            before_index
+        );
+        assert_eq!(fs::read(repo.path().join("file.txt")).unwrap(), before_file);
     }
 }

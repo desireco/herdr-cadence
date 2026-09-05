@@ -635,6 +635,7 @@ impl App {
 
     pub fn integrate_agent(&self, agent_id: &str) -> Result<Value> {
         let config = self.enabled_config()?;
+        let _integration_lock = git::lock_integration(&self.root)?;
         let key = project_key(&self.root);
         let run = self.active_run_snapshot(&key)?;
         let agent = self.state.update(|store| {
