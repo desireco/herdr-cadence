@@ -673,7 +673,7 @@ impl App {
                     .as_deref()
                     .context("agent checkout is unavailable")?,
             );
-            let agent_head = git::head(&checkout)?;
+            let agent_head = verified_worktree_head(&agent)?;
             let commits = git::commits_between(&checkout, &agent.base_sha, &agent_head)?;
             git::cherry_pick(&self.root, &commits)
         })();
@@ -1232,9 +1232,13 @@ impl App {
             if agent.use_worktree {
                 if let Some(workspace_id) = agent.workspace_id.as_deref() {
                     if self.herdr.workspace_exists(workspace_id) {
+                        verified_worktree_head(&agent)?;
                         self.herdr.remove_worktree(workspace_id)?;
                     }
                 } else {
+                    if agent.checkout_path.is_some() {
+                        verified_worktree_head(&agent)?;
+                    }
                     self.cleanup_agent_tab(&agent)?;
                 }
                 let root = PathBuf::from(self.project_root_for_key(key)?);
@@ -1426,6 +1430,30 @@ fn prune_integrated_agents(run: &mut Run) {
 
 fn agent_mut<'a>(run: &'a mut Run, agent_id: &str) -> Result<&'a mut Agent> {
     run.agents.get_mut(agent_id).context("unknown agent")
+}
+
+fn verified_worktree_head(agent: &Agent) -> Result<String> {
+    let checkout = Path::new(
+        agent
+            .checkout_path
+            .as_deref()
+            .context("agent checkout is unavailable")?,
+    );
+    git::ensure_clean(checkout).context("agent checkout changed after its completed report")?;
+    let accepted = agent
+        .report
+        .as_ref()
+        .and_then(|report| report.commit_sha.as_deref())
+        .context("agent has no reviewed commit")?;
+    ensure!(
+        git::head(checkout)? == accepted,
+        "agent HEAD changed after its completed report; submit an updated report before integration or cleanup"
+    );
+    ensure!(
+        git::is_ancestor(checkout, &agent.base_sha, accepted)?,
+        "reviewed commit no longer descends from the assigned base"
+    );
+    Ok(accepted.to_string())
 }
 
 fn unix_ms() -> u128 {
