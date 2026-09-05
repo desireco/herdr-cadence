@@ -343,6 +343,7 @@ if [ "$1 $2" = "agent get" ]; then
       fi
       ;;
   esac
+  printf '%s\n' '{{"error":{{"code":"agent_not_found"}}}}' >&2
   exit 1
 fi
 if [ "$1 $2" = "tab create" ]; then
@@ -1566,6 +1567,7 @@ if [ "$1 $2" = "agent get" ]; then
       exit 0
       ;;
   esac
+  printf '%s\n' '{{"error":{{"code":"agent_not_found"}}}}' >&2
   exit 1
 fi
 if [ "$1 $2" = "pane process-info" ]; then

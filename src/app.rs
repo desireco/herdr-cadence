@@ -128,7 +128,7 @@ impl App {
             Ok(run)
         })?;
 
-        if self.herdr.agent_exists(&run.lead.name) {
+        if self.herdr.agent_exists(&run.lead.name)? {
             self.herdr.focus_agent(&run.lead.name)?;
             return Ok(json!({"status": "focused", "run_id": run.id, "agent": run.lead.name}));
         }
@@ -711,7 +711,7 @@ impl App {
                 };
                 self.notify(&key, &message);
                 if config.git.cleanup_on_success {
-                    if self.herdr.agent_exists(&agent.agent_name) {
+                    if self.herdr.agent_exists(&agent.agent_name)? {
                         let _ = self.herdr.send_ctrl_c(&agent.agent_name);
                     }
                     if let Err(error) = self.cleanup_agent(&key, agent_id) {
@@ -779,7 +779,7 @@ impl App {
                 "cannot resume agent {agent_id}: scope overlaps another active agent"
             );
             ensure!(
-                self.herdr.agent_exists(&agent.agent_name),
+                self.herdr.agent_exists(&agent.agent_name)?,
                 "agent is not running"
             );
             self.herdr.prompt_agent(&agent.agent_name, &prompt)?;
@@ -799,7 +799,7 @@ impl App {
                 ensure_agent_can_cancel(agent_id, force, agent)?;
                 agent.agent_name.clone()
             };
-            if self.herdr.agent_exists(&agent_name) {
+            if self.herdr.agent_exists(&agent_name)? {
                 self.herdr.send_ctrl_c(&agent_name)?;
             }
             agent_mut(active_run_mut(store, &key)?, agent_id)?.status = AgentStatus::Cancelled;
@@ -1023,7 +1023,7 @@ impl App {
                 continue;
             };
             for agent in run.agents.values() {
-                let agent_exists = self.herdr.agent_exists(&agent.agent_name);
+                let agent_exists = self.herdr.agent_exists(&agent.agent_name)?;
                 if config.git.cleanup_on_success
                     && agent.status == AgentStatus::Integrated
                     && agent.cleanup_attempts == 0
@@ -1044,7 +1044,7 @@ impl App {
                     reconciled += 1;
                 }
             }
-            if !self.herdr.agent_exists(&run.lead.name) {
+            if !self.herdr.agent_exists(&run.lead.name)? {
                 self.set_run_error(
                     &key,
                     &run_id,
@@ -1265,7 +1265,7 @@ impl App {
         let result = (|| -> Result<()> {
             if agent.use_worktree {
                 if let Some(workspace_id) = agent.workspace_id.as_deref() {
-                    if self.herdr.workspace_exists(workspace_id) {
+                    if self.herdr.workspace_exists(workspace_id)? {
                         verified_worktree_head(&agent)?;
                         self.herdr.remove_worktree(workspace_id)?;
                     }

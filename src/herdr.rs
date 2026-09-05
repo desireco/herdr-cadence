@@ -72,9 +72,9 @@ impl Herdr {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    pub fn agent_exists(&self, name: &str) -> bool {
-        self.output(["agent", "get", name])
-            .is_ok_and(|output| output.status.success())
+    pub fn agent_exists(&self, name: &str) -> Result<bool> {
+        let output = self.output(["agent", "get", name])?;
+        resource_exists(&output, "agent_not_found")
     }
 
     pub fn agent_tab_id(&self, name: &str) -> Result<Option<String>> {
@@ -93,9 +93,9 @@ impl Herdr {
             .map(str::to_string))
     }
 
-    pub fn workspace_exists(&self, workspace_id: &str) -> bool {
-        self.output(["workspace", "get", workspace_id])
-            .is_ok_and(|output| output.status.success())
+    pub fn workspace_exists(&self, workspace_id: &str) -> Result<bool> {
+        let output = self.output(["workspace", "get", workspace_id])?;
+        resource_exists(&output, "workspace_not_found")
     }
 
     pub fn focus_agent(&self, name: &str) -> Result<()> {
@@ -305,6 +305,16 @@ fn launch_model(
     )?;
     let model = model.split_once('#').map_or(model, |(model, _)| model);
     Ok(Some(format!("{model}#{reasoning_effort}")))
+}
+
+fn resource_exists(output: &Output, not_found: &str) -> Result<bool> {
+    if output.status.success() {
+        Ok(true)
+    } else if has_error_code(output, not_found) {
+        Ok(false)
+    } else {
+        Err(command_error(output))
+    }
 }
 
 fn start_agent_args(

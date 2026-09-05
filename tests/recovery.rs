@@ -412,3 +412,57 @@ fn cancellation_wins_over_report_validation_already_in_flight() {
         "cancelled"
     );
 }
+
+#[test]
+fn lookup_errors_do_not_release_agent_reservations() {
+    let fixture = Fixture::new();
+    fixture.edit_agent(|agent| agent["status"] = "working".into());
+    let before = fixture.run(&["agent", "status", "agent-1"]);
+    fixture.herdr("printf 'connection refused\\n' >&2\nexit 1\n");
+    for args in [
+        &["startup"][..],
+        &["agent", "cancel", "agent-1", "--force"][..],
+    ] {
+        let result = fixture.command(args).output().unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("connection refused"));
+        assert_eq!(fixture.run(&["agent", "status", "agent-1"]), before);
+    }
+    let result = fixture
+        .command(&["startup"])
+        .env("HERDR_BIN_PATH", fixture.dir.path().join("missing-binary"))
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert_eq!(fixture.run(&["agent", "status", "agent-1"]), before);
+
+    fixture.herdr("printf '%s\\n' '{\"error\":{\"code\":\"agent_not_found\"}}' >&2\nexit 1\n");
+    fixture.run(&["startup"]);
+    assert_eq!(
+        fixture.run(&["agent", "status", "agent-1"])["status"],
+        "failed"
+    );
+    fixture.edit_agent(|agent| agent["status"] = "completed".into());
+    fixture.run(&["startup"]);
+    assert_eq!(
+        fixture.run(&["agent", "status", "agent-1"])["status"],
+        "completed"
+    );
+}
+
+#[test]
+fn workspace_lookup_errors_retain_cleanup_resources() {
+    let fixture = Fixture::new();
+    fixture.edit_agent(|agent| agent["status"] = "integrated".into());
+    fixture.herdr("if [ \"$1 $2\" = \"workspace get\" ]; then printf 'connection refused\\n' >&2; exit 1; fi\nexit 0\n");
+    let result = fixture.run(&["startup"]);
+    assert!(
+        result["cleanup_warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("connection refused")
+    );
+    let agent = fixture.run(&["agent", "status", "agent-1"]);
+    assert_eq!(agent["workspace_id"], "workspace-agent");
+    assert!(fixture.dir.path().join("checkout/file.txt").exists());
+}
