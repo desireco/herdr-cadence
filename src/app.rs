@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,6 +27,8 @@ pub struct App {
     pub config_dir: Option<PathBuf>,
     pub binary: PathBuf,
     pub herdr: Herdr,
+    requested_run_id: Option<String>,
+    run_bindings: RefCell<BTreeMap<String, String>>,
 }
 
 impl App {
@@ -45,7 +48,42 @@ impl App {
             config_dir,
             binary: std::env::current_exe().context("cannot resolve Cadence executable")?,
             herdr: Herdr::from_env(),
+            requested_run_id: None,
+            run_bindings: RefCell::new(BTreeMap::new()),
         })
+    }
+
+    pub fn with_run_id(mut self, run_id: Option<String>) -> Self {
+        self.requested_run_id = run_id;
+        self
+    }
+
+    fn check_run_id(&self, key: &str, actual: &str) -> Result<()> {
+        if let Some(expected) = self.requested_run_id.as_deref() {
+            ensure!(
+                expected == actual,
+                "run mismatch: expected {expected}, active run is {actual}"
+            );
+        }
+        let mut bindings = self.run_bindings.borrow_mut();
+        let expected = bindings
+            .entry(key.to_string())
+            .or_insert_with(|| actual.to_string());
+        ensure!(
+            expected == actual,
+            "run changed during command: expected {expected}, active run is {actual}"
+        );
+        Ok(())
+    }
+
+    fn active_run_mut<'a>(
+        &self,
+        store: &'a mut crate::model::Store,
+        key: &str,
+    ) -> Result<&'a mut Run> {
+        let run = lookup_active_run_mut(store, key)?;
+        self.check_run_id(key, &run.id)?;
+        Ok(run)
     }
 
     fn global_config_dir(&self) -> Option<&Path> {
@@ -102,7 +140,8 @@ impl App {
                 .runs
                 .retain(|_, run| run.status != RunStatus::Completed);
             let now = unix_ms();
-            let id = format!("run-{now}-{}", &key[..8]);
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let id = format!("run-{nonce}-{}", &key[..8]);
             let name = format!("cadence-lead-{}", &key[..8]);
             let run = Run {
                 id: id.clone(),
@@ -150,7 +189,7 @@ impl App {
             .create_lead_tab(workspace_id, &self.root, &env)
             .context("failed to create the Lead tab")?;
         self.state.update(|store| {
-            let stored = active_run_mut(store, &key)?;
+            let stored = self.active_run_mut(store, &key)?;
             stored.base_workspace_id = workspace_id.to_string();
             stored.lead.workspace_id = terminal.workspace_id.clone();
             stored.lead.tab_id = Some(terminal.tab_id.clone());
@@ -185,7 +224,7 @@ impl App {
             return Err(error.context("failed to start the Lead"));
         }
         self.state.update(|store| {
-            let stored = active_run_mut(store, &key)?;
+            let stored = self.active_run_mut(store, &key)?;
             stored.lead.harness = lead_harness;
             stored.lead.model = config.lead.model.clone();
             stored.lead.reasoning_effort = lead_reasoning_effort;
@@ -202,7 +241,7 @@ impl App {
         );
         self.herdr.prompt_agent(&run.lead.name, &prompt)?;
         self.state.update(|store| {
-            active_run_mut(store, &key)?.last_error = None;
+            self.active_run_mut(store, &key)?.last_error = None;
             Ok(())
         })?;
         Ok(
@@ -222,6 +261,9 @@ impl App {
                 .and_then(|id| project.runs.get(id))
         });
         let config_valid = config.is_ok();
+        if self.requested_run_id.is_some() {
+            self.check_run_id(&key, &run.context("Cadence has no active run")?.id)?;
+        }
         let enabled = config.as_ref().ok().map(|config| config.enabled);
         let checkout_clean = git::is_clean(&self.root)?;
         let value = json!({
@@ -325,7 +367,7 @@ impl App {
         }
         let base_sha = git::head(&self.root)?;
         let agent = self.state.update(|store| {
-            let run = active_run_mut(store, &key)?;
+            let run = self.active_run_mut(store, &key)?;
             ensure!(run.status == RunStatus::Active, "Cadence run is not active");
             let active = run
                 .agents
@@ -359,7 +401,7 @@ impl App {
                 title_slug
             };
             let branch = if use_worktree {
-                format!("cadence/{}/{}-{}", short_run_id(&run.id), id, title_slug)
+                format!("cadence/{}/{}-{}", run.id, id, title_slug)
             } else {
                 run.base_branch.clone()
             };
@@ -380,7 +422,7 @@ impl App {
                 branch,
                 base_sha: base_sha.clone(),
                 claimed_commits: Vec::new(),
-                agent_name: format!("cadence-{}-a{number}", &key[..6]),
+                agent_name: format!("cadence-{}-a{number}", run.id),
                 status: AgentStatus::Starting,
                 workspace_id: None,
                 tab_id: None,
@@ -420,7 +462,7 @@ impl App {
             }
         };
         self.state.update(|store| {
-            let stored = agent_mut(active_run_mut(store, &key)?, &agent.id)?;
+            let stored = agent_mut(self.active_run_mut(store, &key)?, &agent.id)?;
             stored.workspace_id = terminal.workspace_id.clone();
             stored.tab_id = Some(terminal.tab_id.clone());
             stored.pane_id = Some(terminal.pane_id.clone());
@@ -438,7 +480,7 @@ impl App {
         );
         self.herdr.prompt_agent(&agent.agent_name, &prompt)?;
         self.state.update(|store| {
-            agent_mut(active_run_mut(store, &key)?, &agent.id)?.status = AgentStatus::Working;
+            agent_mut(self.active_run_mut(store, &key)?, &agent.id)?.status = AgentStatus::Working;
             Ok(())
         })?;
         let display_name = agent_display_name(&agent);
@@ -639,7 +681,7 @@ impl App {
         let key = project_key(&self.root);
         let run = self.active_run_snapshot(&key)?;
         let agent = self.state.update(|store| {
-            let agent = agent_mut(active_run_mut(store, &key)?, agent_id)?;
+            let agent = agent_mut(self.active_run_mut(store, &key)?, agent_id)?;
             ensure!(
                 matches!(agent.status, AgentStatus::Completed | AgentStatus::Conflict),
                 "Agent must have a completed report before integration"
@@ -682,7 +724,7 @@ impl App {
         match result {
             Ok(()) => {
                 self.state.update(|store| {
-                    let stored = agent_mut(active_run_mut(store, &key)?, agent_id)?;
+                    let stored = agent_mut(self.active_run_mut(store, &key)?, agent_id)?;
                     stored.status = AgentStatus::Integrated;
                     stored.error = None;
                     Ok(())
@@ -730,7 +772,7 @@ impl App {
             }
             Err(error) => {
                 self.state.update(|store| {
-                    let stored = agent_mut(active_run_mut(store, &key)?, agent_id)?;
+                    let stored = agent_mut(self.active_run_mut(store, &key)?, agent_id)?;
                     stored.status = AgentStatus::Conflict;
                     stored.error = Some(error.to_string());
                     Ok(())
@@ -747,7 +789,7 @@ impl App {
         ensure!(!prompt.trim().is_empty(), "prompt cannot be empty");
         let key = project_key(&self.root);
         self.state.update(|store| {
-            let run = active_run_mut(store, &key)?;
+            let run = self.active_run_mut(store, &key)?;
             let agent = run.agents.get(agent_id).context("unknown agent")?;
             ensure!(
                 matches!(
@@ -796,14 +838,14 @@ impl App {
         let key = project_key(&self.root);
         self.state.update(|store| {
             let agent_name = {
-                let agent = agent_mut(active_run_mut(store, &key)?, agent_id)?;
+                let agent = agent_mut(self.active_run_mut(store, &key)?, agent_id)?;
                 ensure_agent_can_cancel(agent_id, force, agent)?;
                 agent.agent_name.clone()
             };
             if self.herdr.agent_exists(&agent_name)? {
                 self.herdr.send_ctrl_c(&agent_name)?;
             }
-            agent_mut(active_run_mut(store, &key)?, agent_id)?.status = AgentStatus::Cancelled;
+            agent_mut(self.active_run_mut(store, &key)?, agent_id)?.status = AgentStatus::Cancelled;
             Ok(())
         })?;
         self.agent_status(agent_id)
@@ -857,6 +899,14 @@ impl App {
             }
         }
         self.state.update(|store| {
+            let finishing = self.active_run_mut(store, &key)?;
+            ensure!(
+                finishing
+                    .agents
+                    .values()
+                    .all(|agent| agent.status.is_terminal()),
+                "cannot finish: agents became active during the command"
+            );
             let project = store.projects.get_mut(&key).context("unknown project")?;
             let run_id = project.active_run.clone().context("no active run")?;
             project.runs.remove(&run_id).context("unknown run")?;
@@ -1072,6 +1122,7 @@ impl App {
             .active_run
             .as_ref()
             .context("Cadence has no active run")?;
+        self.check_run_id(key, run_id)?;
         Ok(project
             .runs
             .get(run_id)
@@ -1087,7 +1138,7 @@ impl App {
         status: AgentStatus,
     ) -> Result<()> {
         self.state.update(|store| {
-            let agent = agent_mut(active_run_mut(store, key)?, agent_id)?;
+            let agent = agent_mut(self.active_run_mut(store, key)?, agent_id)?;
             ensure_agent_can_report(agent)?;
             agent.report = Some(report);
             agent.status = status;
@@ -1103,7 +1154,7 @@ impl App {
         claimed_commits: Vec<String>,
     ) -> Result<()> {
         self.state.update(|store| {
-            let agent = agent_mut(active_run_mut(store, key)?, agent_id)?;
+            let agent = agent_mut(self.active_run_mut(store, key)?, agent_id)?;
             ensure_agent_can_report(agent)?;
             agent.report = Some(report);
             agent.claimed_commits = claimed_commits;
@@ -1114,7 +1165,7 @@ impl App {
 
     fn fail_agent(&self, key: &str, agent_id: &str, message: &str) -> Result<()> {
         self.state.update(|store| {
-            let agent = agent_mut(active_run_mut(store, key)?, agent_id)?;
+            let agent = agent_mut(self.active_run_mut(store, key)?, agent_id)?;
             agent.status = AgentStatus::Failed;
             agent.error = Some(message.to_string());
             Ok(())
@@ -1135,7 +1186,7 @@ impl App {
             attempt.model = runner.model.clone();
             attempt.reasoning_effort = runner.reasoning_effort;
             self.state.update(|store| {
-                let stored = agent_mut(active_run_mut(store, key)?, &attempt.id)?;
+                let stored = agent_mut(self.active_run_mut(store, key)?, &attempt.id)?;
                 stored.runner = attempt.runner.clone();
                 stored.harness = attempt.harness;
                 stored.model = attempt.model.clone();
@@ -1282,7 +1333,7 @@ impl App {
                 self.cleanup_agent_tab(&agent)?;
             }
             self.state.update(|store| {
-                let stored = agent_mut(active_run_mut(store, key)?, agent_id)?;
+                let stored = agent_mut(self.active_run_mut(store, key)?, agent_id)?;
                 stored.workspace_id = None;
                 stored.tab_id = None;
                 stored.pane_id = None;
@@ -1294,7 +1345,7 @@ impl App {
         })();
         if let Err(error) = result {
             self.state.update(|store| {
-                agent_mut(active_run_mut(store, key)?, agent_id)?.cleanup_attempts = attempt;
+                agent_mut(self.active_run_mut(store, key)?, agent_id)?.cleanup_attempts = attempt;
                 Ok(())
             })?;
             return Err(error).context(format!(
@@ -1364,7 +1415,7 @@ pub fn context_workspace_id() -> Result<String> {
         .context("Cadence start must be invoked from a Herdr workspace")
 }
 
-fn active_run_mut<'a>(store: &'a mut crate::model::Store, key: &str) -> Result<&'a mut Run> {
+fn lookup_active_run_mut<'a>(store: &'a mut crate::model::Store, key: &str) -> Result<&'a mut Run> {
     let project = store
         .projects
         .get_mut(key)
@@ -1513,15 +1564,6 @@ fn unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
-}
-
-fn short_run_id(run_id: &str) -> String {
-    run_id
-        .strip_prefix("run-")
-        .unwrap_or(run_id)
-        .chars()
-        .take(12)
-        .collect()
 }
 
 fn slug(value: &str, max: usize) -> String {

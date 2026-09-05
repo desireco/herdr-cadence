@@ -101,6 +101,7 @@ impl Fixture {
             .arg(self.dir.path().join("state"))
             .env_remove("CADENCE_CONFIG_DIR")
             .env_remove("HERDR_PLUGIN_CONFIG_DIR")
+            .env("CADENCE_RUN_ID", "run-test")
             .env("HERDR_BIN_PATH", self.dir.path().join("herdr"))
             .args(args);
         command
@@ -531,4 +532,85 @@ fn integrations_for_different_agents_cannot_overlap() {
         fs::read_to_string(repo.join("second.txt")).unwrap(),
         "second\n"
     );
+}
+
+#[test]
+fn reports_require_the_assigned_run_identity() {
+    let fixture = Fixture::new();
+    let report = fixture.dir.path().join("report.json");
+    fs::write(&report, r#"{"status":"blocked","summary":"Late report"}"#).unwrap();
+    let args = [
+        "agent",
+        "complete",
+        "agent-1",
+        "--report-file",
+        report.to_str().unwrap(),
+    ];
+    let before = fs::read(fixture.dir.path().join("state/state.json")).unwrap();
+    for missing in [false, true] {
+        let mut command = fixture.command(&args);
+        if missing {
+            command.env_remove("CADENCE_RUN_ID");
+        } else {
+            command.env("CADENCE_RUN_ID", "retired-run");
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(if missing {
+                "requires --run-id"
+            } else {
+                "run mismatch"
+            })
+        );
+        assert_eq!(
+            fs::read(fixture.dir.path().join("state/state.json")).unwrap(),
+            before
+        );
+    }
+    let output = fixture
+        .command(&args)
+        .args(["--run-id", "run-test"])
+        .env("CADENCE_RUN_ID", "retired-run")
+        .output()
+        .unwrap();
+    assert_eq!(success(output)["status"], "blocked");
+}
+
+#[test]
+fn in_flight_reports_cannot_write_into_a_replacement_run() {
+    let fixture = Fixture::new();
+    let report = fixture.dir.path().join("report.json");
+    let agent = fixture.run(&["agent", "status", "agent-1"]);
+    fs::write(&report, serde_json::to_vec(&agent["report"]).unwrap()).unwrap();
+    let child = fixture
+        .command(&[
+            "agent",
+            "complete",
+            "agent-1",
+            "--report-file",
+            report.to_str().unwrap(),
+        ])
+        .env("PATH", paused_git(&fixture))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file(&fixture.dir.path().join("started"));
+    let path = fixture.dir.path().join("state/state.json");
+    let mut store: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let key = project_key(&fixture.dir.path().join("repo"));
+    let project = &mut store["projects"][key];
+    let mut replacement = project["runs"]["run-test"].clone();
+    replacement["id"] = "replacement-run".into();
+    replacement["agents"]["agent-1"]["status"] = "working".into();
+    project["runs"]["replacement-run"] = replacement;
+    project["active_run"] = "replacement-run".into();
+    fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+    let before = fs::read(&path).unwrap();
+    fs::write(fixture.dir.path().join("release"), "go").unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("run mismatch"));
+    assert_eq!(fs::read(path).unwrap(), before);
 }

@@ -1562,7 +1562,7 @@ if [ "$1 $2" = "agent get" ]; then
         exit 0
       fi
       ;;
-    cadence-??????-a*)
+    cadence-??????-a*|cadence-run-*-a*)
       printf '%s\n' '{{"id":"test","result":{{"agent":{{"tab_id":"agent-tab"}}}}}}'
       exit 0
       ;;
@@ -2008,6 +2008,8 @@ fi
         assert!(calls.contains("create exactly one commit for changed files"));
     }
     assert!(calls.contains("agent start cadence-"));
+    assert!(calls.contains(&format!("agent start cadence-{active_run}-a1")));
+    assert!(calls.contains(&format!("--run-id {active_run} agent complete agent-1")));
     let agent_launch = "--kind codex --pane pane-agent --timeout 120000 -- --model qa-model --config model_reasoning_effort=\"low\"";
     assert!(calls.contains(agent_launch));
     let selected_launch = if force_primary_credit_failure {
@@ -2122,6 +2124,8 @@ fi
             "agent",
             "complete",
             "agent-1",
+            "--run-id",
+            active_run,
             "--report-file",
             report.to_str().unwrap(),
         ])
@@ -2409,6 +2413,8 @@ fi
             "agent",
             "complete",
             "agent-2",
+            "--run-id",
+            active_run,
             "--report-file",
             report.to_str().unwrap(),
         ])

@@ -16,6 +16,9 @@ struct Cli {
     /// `.cadence.toml`. Defaults to Herdr's per-plugin config directory.
     #[arg(long, global = true, env = "CADENCE_CONFIG_DIR")]
     config_dir: Option<PathBuf>,
+    /// Expected run identity; required when submitting an agent report.
+    #[arg(long, global = true, env = "CADENCE_RUN_ID")]
+    run_id: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -139,6 +142,22 @@ fn run() -> Result<()> {
         App::new_runtime(root, state_dir, config_dir)?
     } else {
         App::new(root, state_dir, config_dir)?
+    };
+    if matches!(
+        &cli.command,
+        Command::Agent {
+            command: AgentCommand::Complete { .. }
+        }
+    ) {
+        anyhow::ensure!(
+            cli.run_id.is_some(),
+            "agent complete requires --run-id or CADENCE_RUN_ID; use the run ID from the agent's assignment"
+        );
+    }
+    let app = if matches!(&cli.command, Command::Agent { .. } | Command::Run { .. }) {
+        app.with_run_id(cli.run_id)
+    } else {
+        app
     };
     let value = match cli.command {
         Command::Action { action } => match action {

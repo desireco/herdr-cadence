@@ -143,7 +143,7 @@ Acceptance criteria:
 {acceptance}
 
 Follow repository instructions. Modify only the allowed scope and run relevant tests. Label communicated findings as High (Blockers), Mid, Low, or Wish. {permission_guidance} {git_guidance} Then write a JSON report with status (completed, blocked, or failed), summary, tests, changed_paths, blockers, and optional commit_sha. Submit it with:
-  {bin} --state-dir {state}{config} --project-root {root} agent complete {agent_id} --report-file <path>
+  {bin} --state-dir {state}{config} --project-root {root} --run-id {run_id} agent complete {agent_id} --report-file <path>
 
 If completion returns integrated, exit the agent. If it returns completed, remain available while the Lead reviews your report, then exit when Cadence says the commit was accepted. If blocked, remain available for a Lead follow-up."#,
         task = agent.task,
