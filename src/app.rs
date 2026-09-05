@@ -589,6 +589,7 @@ impl App {
                             "reported commit_sha is not Agent HEAD"
                         );
                     }
+                    validated_worktree_commits(agent, &agent_head)?;
                     let changed_paths =
                         git::changed_paths(&checkout, &agent.base_sha, &agent_head)?;
                     (Some(agent_head), changed_paths, Vec::new())
@@ -728,14 +729,8 @@ impl App {
                 return Ok(());
             }
             git::ensure_clean(&self.root)?;
-            let checkout = PathBuf::from(
-                agent
-                    .checkout_path
-                    .as_deref()
-                    .context("agent checkout is unavailable")?,
-            );
             let agent_head = verified_worktree_head(&agent)?;
-            let commits = git::commits_between(&checkout, &agent.base_sha, &agent_head)?;
+            let commits = validated_worktree_commits(&agent, &agent_head)?;
             git::cherry_pick(&self.root, &commits)
         })();
         match result {
@@ -1557,6 +1552,25 @@ fn verified_worktree_head(agent: &Agent) -> Result<String> {
         "reviewed commit no longer descends from the assigned base"
     );
     Ok(accepted.to_string())
+}
+
+fn validated_worktree_commits(agent: &Agent, head: &str) -> Result<Vec<String>> {
+    let checkout = Path::new(
+        agent
+            .checkout_path
+            .as_deref()
+            .context("agent checkout is unavailable")?,
+    );
+    let commits = git::commits_between(checkout, &agent.base_sha, head)?;
+    for commit in &commits {
+        for path in git::changed_paths_for_commit(checkout, commit)? {
+            ensure!(
+                path_within_scope(&path, &agent.scope),
+                "Agent commit {commit} changed path outside its reserved scope: {path}"
+            );
+        }
+    }
+    Ok(commits)
 }
 
 fn ensure_agent_can_report(agent: &Agent) -> Result<()> {

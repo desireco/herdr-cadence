@@ -692,3 +692,79 @@ exit 0
             .success()
     );
 }
+
+#[test]
+fn reverted_out_of_scope_commits_are_rejected_at_report_and_integration() {
+    let fixture = Fixture::new();
+    let checkout = fixture.dir.path().join("checkout");
+    let repo = fixture.dir.path().join("repo");
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    fs::write(checkout.join("outside.txt"), "outside scope\n").unwrap();
+    git(&checkout, &["add", "outside.txt"]);
+    git(&checkout, &["commit", "-m", "outside scope"]);
+    let outside_commit = git(&checkout, &["rev-parse", "HEAD"]);
+    git(&checkout, &["revert", "--no-edit", "HEAD"]);
+    let head = git(&checkout, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git(
+            &checkout,
+            &["diff", "--name-only", &format!("{base}..{head}")]
+        ),
+        "file.txt"
+    );
+    let mut report = fixture.run(&["agent", "status", "agent-1"])["report"].clone();
+    report["commit_sha"] = head.into();
+    let path = fixture.dir.path().join("report.json");
+    fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
+    let output = fixture
+        .command(&[
+            "agent",
+            "complete",
+            "agent-1",
+            "--report-file",
+            path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("outside.txt"));
+    assert!(error.contains(&outside_commit));
+    // Reports accepted by older versions must also be checked before integration.
+    fixture.edit_agent(|agent| agent["report"] = report);
+    let result = fixture.run(&["agent", "integrate", "agent-1"]);
+    assert_eq!(result["status"], "conflict");
+    assert!(result["error"].as_str().unwrap().contains("outside.txt"));
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), base);
+    assert!(checkout.exists());
+}
+
+#[test]
+fn multiple_in_scope_commits_can_still_complete_and_integrate() {
+    let fixture = Fixture::new();
+    let checkout = fixture.dir.path().join("checkout");
+    fs::write(checkout.join("file.txt"), "second change\n").unwrap();
+    git(&checkout, &["commit", "-am", "second in-scope change"]);
+    let mut report = fixture.run(&["agent", "status", "agent-1"])["report"].clone();
+    report["commit_sha"] = git(&checkout, &["rev-parse", "HEAD"]).into();
+    let path = fixture.dir.path().join("report.json");
+    fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
+    assert_eq!(
+        fixture.run(&[
+            "agent",
+            "complete",
+            "agent-1",
+            "--report-file",
+            path.to_str().unwrap()
+        ])["status"],
+        "completed"
+    );
+    assert_eq!(
+        fixture.run(&["agent", "integrate", "agent-1"])["status"],
+        "integrated"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.path().join("repo/file.txt")).unwrap(),
+        "second change\n"
+    );
+}
