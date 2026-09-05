@@ -3,6 +3,8 @@ use std::path::Path;
 use crate::config::Config;
 use crate::model::{Agent, Run};
 
+const CANCELLATION_GUIDANCE: &str = "Idle/done observations must never alone trigger cancellation. Inspect status/report and runtime evidence. Use `agent cancel <id> --force` for user intent, confirmed exit, nonresponse after follow-up/progress checks, or a verified blocker requiring reassignment (including stale base metadata). Within the assigned task, recover without asking permission: cancellation retains worktrees/reports/commits and releases scope; preserve accepted work for integration by the replacement.";
+
 /// The `--config-dir` flag to append to the invocations the Lead and its agents
 /// are told to run, empty when no global config directory is in play.
 fn config_flag(config_dir: Option<&Path>) -> String {
@@ -13,7 +15,7 @@ fn config_flag(config_dir: Option<&Path>) -> String {
 
 pub fn lead_compact(run_id: &str) -> String {
     format!(
-        "You remain Lead for Cadence run {run_id}; only you talk to the user. Codex compaction recovery: coordinate delivery, delegate specialized/multi-step work via bounded non-overlapping agent spawn, and do trivial low-risk work directly. Use agent list/status/report/prompt/cancel/integrate; review reports, preserve failed/conflicted work, verify and commit coherent blocks, and preserve unrelated changes. Cadence Agent.status is authoritative; observed_agent_status is advisory. Idle/done observations commonly occur between turns and must never alone trigger cancellation. Use agent cancel --force only for explicit user intent or verified nonresponse after repeated transcript/progress checks. Report results and stay available. Use run finish only when the user asks to end the session and no agents are active. Do not broaden scope or let agents delegate."
+        "Lead for Cadence run {run_id}; only you talk to the user. Delegate bounded work via agent spawn; do trivial work directly. Use agent list/status/report/prompt/cancel/integrate. Cadence Agent.status is authoritative; observed_agent_status is advisory. {CANCELLATION_GUIDANCE} Verify and commit; preserve unrelated changes. Stay available; run finish only when the user asks and no agents are active. No agent delegation."
     )
 }
 
@@ -65,15 +67,15 @@ Coordinate delivery. Do trivial, low-risk work directly; delegate specialized, m
 Roles:
 {roles}
 
-Pick the best role; default to `{agent_default}`. Run at most {max} agents with non-overlapping repository-relative scopes. Scope paths are literal, never globs; directories cover everything under them. Include any shared-checkout root Markdown artifact in scope. Ordered runner fallback applies only to launch-time provider availability (credits, quota, rate limit, capacity, auth); a launched runner stays pinned. Retain failed/blocked resources and decide reassignment.
+Pick the best role; default to `{agent_default}`. At most {max} agents with non-overlapping repository-relative scopes: literal paths, no globs; directories include descendants. Scope shared-checkout root Markdown too. Runner fallback: launch-time availability only (credits/quota/rate/capacity/auth); launched runners stay pinned. Retain failed/blocked resources.
 
-Spawn with a JSON request containing title, task, scope, acceptance, and role:
+Spawn JSON: title, task, scope, acceptance, role:
   {bin} --state-dir {state}{config} --project-root {root} agent spawn --request-file <path>
-Manage with `agent list|status|report`, `agent prompt <id> --prompt-file <path>`, and `agent cancel <id> --force` only for explicit user intent or verified nonresponse after repeated transcript/progress checks. Cadence Agent.status is authoritative; observed_agent_status is advisory. Idle/done observations commonly occur between turns and must never alone trigger cancellation. {integration_guidance}
+Manage with `agent list|status|report` and `agent prompt <id> --prompt-file <path>`. Cadence Agent.status is authoritative; observed_agent_status is advisory. {CANCELLATION_GUIDANCE} {integration_guidance}
 
-For each coherent change block: verify, stage only task paths, and commit locally before continuing or reporting; this includes Lead and integrated agent work. Preserve unrelated changes; push only on request. Handle routine verification; ask the user only about material scope, destructive actions, or retained conflicts.
+Verify each coherent Lead/integrated change, stage only task paths, and commit before continuing or reporting. Preserve unrelated changes; push only on request. Handle routine recovery/verification; ask about scope changes or destructive conflict resolution.
 
-Findings use High (Blockers), Mid, Low, or Wish. In review cycles: verify High/security/data-integrity findings, sanity-check the rest, send one consolidated developer correction, and have the reviewer recheck only changed areas and prior Highs. After review two, fix remaining small non-High items directly.
+Findings: High (Blockers), Mid, Low, or Wish. Verify High/security/data-integrity findings; sanity-check others. Send one consolidated correction; recheck changed areas and prior Highs. After review two, fix small non-High items directly.
 
 {lead_access}
 {dirty_guidance}
@@ -212,11 +214,8 @@ mod tests {
         assert!(prompt.contains("--state-dir /state --config-dir /config"));
         assert!(prompt.contains("Cadence Agent.status is authoritative"));
         assert!(prompt.contains("observed_agent_status is advisory"));
-        assert!(prompt.contains("Idle/done observations commonly occur between turns"));
         assert!(prompt.contains("must never alone trigger cancellation"));
-        assert!(prompt.contains(
-            "explicit user intent or verified nonresponse after repeated transcript/progress checks"
-        ));
+        assert!(prompt.contains(super::CANCELLATION_GUIDANCE));
     }
 
     #[test]
@@ -230,10 +229,7 @@ mod tests {
         assert!(prompt.contains("run finish only when the user asks"));
         assert!(prompt.contains("Cadence Agent.status is authoritative"));
         assert!(prompt.contains("observed_agent_status is advisory"));
-        assert!(prompt.contains("Idle/done observations commonly occur between turns"));
         assert!(prompt.contains("must never alone trigger cancellation"));
-        assert!(prompt.contains(
-            "explicit user intent or verified nonresponse after repeated transcript/progress checks"
-        ));
+        assert!(prompt.contains(super::CANCELLATION_GUIDANCE));
     }
 }

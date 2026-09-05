@@ -895,9 +895,13 @@ fn codex_compact_hook_emits_session_start_context_json() {
     assert!(context.contains("Cadence Agent.status is authoritative"));
     assert!(context.contains("observed_agent_status is advisory"));
     assert!(context.contains("must never alone trigger cancellation"));
-    assert!(context.contains(
-        "explicit user intent or verified nonresponse after repeated transcript/progress checks"
-    ));
+    assert!(context.contains("confirmed exit"));
+    assert!(context.contains("nonresponse after follow-up/progress checks"));
+    assert!(
+        context.contains("verified blocker requiring reassignment (including stale base metadata)")
+    );
+    assert!(context.contains("Within the assigned task, recover without asking permission"));
+    assert!(context.contains("preserve accepted work for integration by the replacement"));
 }
 
 #[test]
@@ -1931,21 +1935,19 @@ fi
     assert!(calls.contains("Until given a task, reply briefly that Cadence is ready"));
     assert!(calls.contains("Do trivial, low-risk work directly"));
     assert!(calls.contains("Never edit an active agent's scope"));
-    assert!(calls.contains("For each coherent change block: verify, stage only task paths"));
-    assert!(calls.contains("this includes Lead and integrated agent work"));
+    assert!(calls.contains("Verify each coherent Lead/integrated change, stage only task paths"));
+    assert!(calls.contains("commit before continuing or reporting"));
     assert!(calls.contains("Preserve unrelated changes; push only on request"));
     assert_eq!(calls.contains("The checkout is dirty"), dirty_at_start);
     assert!(calls.contains("a completed task does not end the run"));
     assert!(calls.contains("Use `run finish` only when the user asks to end the session"));
     assert!(calls.contains("Use spawn `display_name` in user updates"));
     assert!(calls.contains("not Agent 2/agent-2"));
+    assert!(calls.contains("Runner fallback: launch-time availability only"));
+    assert!(calls.contains("Findings: High (Blockers), Mid, Low, or Wish"));
     assert!(
-        calls.contains("Ordered runner fallback applies only to launch-time provider availability")
+        calls.contains("Send one consolidated correction; recheck changed areas and prior Highs")
     );
-    assert!(calls.contains("Findings use High (Blockers), Mid, Low, or Wish"));
-    assert!(calls.contains(
-        "send one consolidated developer correction, and have the reviewer recheck only changed areas and prior Highs"
-    ));
     assert!(calls.contains("Label communicated findings as High (Blockers), Mid, Low, or Wish"));
     match lead_harness {
         herdr_cadence::config::Harness::Codex => {
