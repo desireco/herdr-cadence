@@ -482,7 +482,9 @@ impl App {
         let key = project_key(&self.root);
         let display_name = {
             let run = self.active_run_snapshot(&key)?;
-            agent_display_name(run.agents.get(agent_id).context("unknown agent")?)
+            let agent = run.agents.get(agent_id).context("unknown agent")?;
+            ensure_agent_can_report(agent)?;
+            agent_display_name(agent)
         };
         match report.status {
             ReportStatus::Blocked => {
@@ -635,15 +637,14 @@ impl App {
         let config = self.enabled_config()?;
         let key = project_key(&self.root);
         let run = self.active_run_snapshot(&key)?;
-        let agent = run.agents.get(agent_id).context("unknown agent")?.clone();
-        self.state.update(|store| {
+        let agent = self.state.update(|store| {
             let agent = agent_mut(active_run_mut(store, &key)?, agent_id)?;
             ensure!(
                 matches!(agent.status, AgentStatus::Completed | AgentStatus::Conflict),
                 "Agent must have a completed report before integration"
             );
             agent.status = AgentStatus::Integrating;
-            Ok(())
+            Ok(agent.clone())
         })?;
         let result = (|| -> Result<()> {
             git::ensure_clean(&self.root)?;
@@ -740,18 +741,49 @@ impl App {
     }
 
     pub fn prompt_agent(&self, agent_id: &str, prompt_file: &Path) -> Result<Value> {
+        let config = self.enabled_config()?;
         let prompt = fs::read_to_string(prompt_file)?;
         ensure!(!prompt.trim().is_empty(), "prompt cannot be empty");
         let key = project_key(&self.root);
-        let run = self.active_run_snapshot(&key)?;
-        let agent = run.agents.get(agent_id).context("unknown agent")?;
-        ensure!(
-            self.herdr.agent_exists(&agent.agent_name),
-            "agent is not running"
-        );
-        self.herdr.prompt_agent(&agent.agent_name, &prompt)?;
         self.state.update(|store| {
-            let agent = agent_mut(active_run_mut(store, &key)?, agent_id)?;
+            let run = active_run_mut(store, &key)?;
+            let agent = run.agents.get(agent_id).context("unknown agent")?;
+            ensure!(
+                matches!(
+                    agent.status,
+                    AgentStatus::Starting
+                        | AgentStatus::Working
+                        | AgentStatus::Blocked
+                        | AgentStatus::Completed
+                        | AgentStatus::Conflict
+                        | AgentStatus::Failed
+                ),
+                "cannot prompt agent {agent_id}: lifecycle status is `{}`",
+                lifecycle_status_name(&agent.status)
+            );
+            ensure!(
+                agent.status.occupies_slot()
+                    || run
+                        .agents
+                        .values()
+                        .filter(|agent| agent.status.occupies_slot())
+                        .count()
+                        < config.max_parallel(),
+                "agent limit reached ({})",
+                config.max_parallel()
+            );
+            ensure!(
+                !run.agents.values().any(|other| other.id != agent_id
+                    && other.status.reserves_scope()
+                    && scopes_overlap(&other.scope, &agent.scope)),
+                "cannot resume agent {agent_id}: scope overlaps another active agent"
+            );
+            ensure!(
+                self.herdr.agent_exists(&agent.agent_name),
+                "agent is not running"
+            );
+            self.herdr.prompt_agent(&agent.agent_name, &prompt)?;
+            let agent = agent_mut(run, agent_id)?;
             agent.status = AgentStatus::Working;
             agent.error = None;
             Ok(())
@@ -1055,6 +1087,7 @@ impl App {
     ) -> Result<()> {
         self.state.update(|store| {
             let agent = agent_mut(active_run_mut(store, key)?, agent_id)?;
+            ensure_agent_can_report(agent)?;
             agent.report = Some(report);
             agent.status = status;
             Ok(())
@@ -1070,6 +1103,7 @@ impl App {
     ) -> Result<()> {
         self.state.update(|store| {
             let agent = agent_mut(active_run_mut(store, key)?, agent_id)?;
+            ensure_agent_can_report(agent)?;
             agent.report = Some(report);
             agent.claimed_commits = claimed_commits;
             agent.status = AgentStatus::Completed;
@@ -1454,6 +1488,23 @@ fn verified_worktree_head(agent: &Agent) -> Result<String> {
         "reviewed commit no longer descends from the assigned base"
     );
     Ok(accepted.to_string())
+}
+
+fn ensure_agent_can_report(agent: &Agent) -> Result<()> {
+    ensure!(
+        matches!(
+            agent.status,
+            AgentStatus::Starting
+                | AgentStatus::Working
+                | AgentStatus::Blocked
+                | AgentStatus::Completed
+                | AgentStatus::Conflict
+        ),
+        "cannot report for agent {}: lifecycle status is `{}`",
+        agent.id,
+        lifecycle_status_name(&agent.status)
+    );
+    Ok(())
 }
 
 fn unix_ms() -> u128 {
