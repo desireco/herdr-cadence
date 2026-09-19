@@ -1645,6 +1645,9 @@ fn configured_agent_launch_args(
             state_dir.display().to_string(),
         ],
         (Harness::Opencode, _) => Vec::new(),
+        // pi needs no extra launch args; state-dir scoping is enforced by pi's
+        // own working directory, and skills can be passed via agent_args.
+        (Harness::Pi, _) => Vec::new(),
     }
 }
 
@@ -1677,6 +1680,8 @@ fn yolo_agent_args(harness: Harness, yolo: bool) -> Vec<String> {
         Harness::Claude => vec!["--dangerously-skip-permissions".into()],
         Harness::Codex => vec!["--dangerously-bypass-approvals-and-sandbox".into()],
         Harness::Opencode => vec!["--auto".into()],
+        // pi has no permission-bypass flag; yolo is a no-op for it.
+        Harness::Pi => Vec::new(),
     }
 }
 

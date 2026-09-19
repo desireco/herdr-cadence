@@ -6,6 +6,12 @@ Cadence is a light Orchestrating plugin for Herdr that provides one **Lead** and
 | Codex | Supported | Supported | 
 | Claude | Untested | Supported* |
 | Opencode | Untested | Untested | 
+| Pi | Supported | Supported | 
+
+Pi notes: set the model in `provider/id` form (e.g. `zai/glm-5.3`) so pi resolves the
+provider; `reasoning_effort` is ignored — encode thinking level in the model string
+(e.g. `zai/glm-5.3:high`) if your provider supports it; `yolo` has no effect (pi has
+no permission-bypass flag).
 
 * need to manually run and accept once: 
 ```

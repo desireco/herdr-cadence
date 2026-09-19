@@ -1390,6 +1390,19 @@ fn keeps_claude_lead_instructions_as_a_post_launch_prompt() {
 }
 
 #[test]
+fn starts_a_pi_lead_without_effort_flags() {
+    run_agent_flow_with_lead(
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        herdr_cadence::config::Harness::Pi,
+    );
+}
+
+#[test]
 fn relaunches_lead_from_current_config_and_refreshes_persisted_settings() {
     run_agent_flow_with_relaunch();
 }
@@ -1792,18 +1805,25 @@ fi
                 "--kind opencode --pane pane-lead --timeout 120000 -- --model {model}#{}",
                 reasoning_effort.as_str().unwrap()
             ),
+            herdr_cadence::config::Harness::Pi => format!(
+                "--kind pi --pane pane-lead --timeout 120000 -- --model {model}"
+            ),
         };
         assert!(relaunch_calls.contains(&expected_launch));
         assert!(!relaunch_calls.contains("openai/lead-model"));
         if *yolo {
             let yolo_arg = match harness {
-                herdr_cadence::config::Harness::Claude => "--dangerously-skip-permissions",
+                herdr_cadence::config::Harness::Claude => Some("--dangerously-skip-permissions"),
                 herdr_cadence::config::Harness::Codex => {
-                    "--dangerously-bypass-approvals-and-sandbox"
+                    Some("--dangerously-bypass-approvals-and-sandbox")
                 }
-                herdr_cadence::config::Harness::Opencode => "--auto",
+                herdr_cadence::config::Harness::Opencode => Some("--auto"),
+                // pi has no permission-bypass flag.
+                herdr_cadence::config::Harness::Pi => None,
             };
-            assert!(relaunch_calls.contains(yolo_arg));
+            if let Some(yolo_arg) = yolo_arg {
+                assert!(relaunch_calls.contains(yolo_arg));
+            }
         }
         if *harness != herdr_cadence::config::Harness::Codex {
             assert!(!relaunch_calls.contains("hooks.SessionStart"));
@@ -1992,6 +2012,13 @@ fi
             } else {
                 assert!(!calls.contains(&format!("{lead_launch} --auto")));
             }
+        }
+        herdr_cadence::config::Harness::Pi => {
+            let lead_launch =
+                "--kind pi --pane pane-lead --timeout 120000 -- --model openai/lead-model";
+            assert!(calls.contains(lead_launch));
+            assert!(calls.contains("agent prompt cadence-lead-"));
+            assert!(!calls.contains("developer_instructions="));
         }
     }
     assert!(calls.contains("Checkout mode is fixed by role"));

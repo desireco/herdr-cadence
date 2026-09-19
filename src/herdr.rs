@@ -351,6 +351,7 @@ fn start_agent_args(
                 format!("model_reasoning_effort=\"{reasoning_effort}\""),
             ]),
             Harness::Opencode => {}
+            Harness::Pi => {}
         }
     }
     args.extend(agent_args.iter().cloned());
@@ -556,6 +557,37 @@ mod tests {
                 "--effort",
                 "high",
                 "--dangerously-skip-permissions",
+            ]
+        );
+    }
+
+    #[test]
+    fn passes_pi_model_through_without_effort_flags() {
+        let args = start_agent_args(
+            "researcher",
+            Harness::Pi,
+            "pane-1",
+            Some("zai/glm-5.3-flash"),
+            ReasoningEffort::High,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            args,
+            [
+                "agent",
+                "start",
+                "researcher",
+                "--kind",
+                "pi",
+                "--pane",
+                "pane-1",
+                "--timeout",
+                "120000",
+                "--",
+                "--model",
+                "zai/glm-5.3-flash",
             ]
         );
     }

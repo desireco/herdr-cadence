@@ -171,6 +171,7 @@ pub enum Harness {
     Claude,
     Codex,
     Opencode,
+    Pi,
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -210,6 +211,7 @@ impl Harness {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Opencode => "opencode",
+            Self::Pi => "pi",
         }
     }
 }
@@ -605,6 +607,20 @@ mod tests {
             generalist.version_control_mode,
             VersionControlMode::SharedCheckout
         );
+    }
+
+    #[test]
+    fn parses_the_pi_harness() {
+        let raw = toml::to_string_pretty(&Config::default())
+            .unwrap()
+            .replacen(
+                "[lead]\nharness = \"codex\"",
+                "[lead]\nharness = \"pi\"",
+                1,
+            );
+        let parsed: Config = toml::from_str(&raw).unwrap();
+        assert_eq!(parsed.lead.harness, Harness::Pi);
+        assert_eq!(parsed.lead.harness.as_str(), "pi");
     }
 
     #[test]
