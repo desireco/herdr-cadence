@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::config::{Config, Harness, ResolvedRunner, VersionControlMode};
 use crate::git;
@@ -142,7 +143,7 @@ impl App {
             let now = unix_ms();
             let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
             let id = format!("run-{nonce}-{}", &key[..8]);
-            let name = format!("cadence-lead-{id}");
+            let name = herdr_agent_name(&id, None);
             let run = Run {
                 id: id.clone(),
                 status: RunStatus::Active,
@@ -439,7 +440,7 @@ impl App {
                 branch,
                 base_sha: base_sha.clone(),
                 claimed_commits: Vec::new(),
-                agent_name: format!("cadence-{}-a{number}", run.id),
+                agent_name: herdr_agent_name(&run.id, Some(number)),
                 status: AgentStatus::Starting,
                 workspace_id: None,
                 tab_id: None,
@@ -1699,6 +1700,22 @@ fn display_role(role: &str) -> String {
         .join(" ")
 }
 
+fn herdr_agent_name(run_id: &str, number: Option<u32>) -> String {
+    // Herdr permits at most 32 ASCII characters. Hash the full run identity,
+    // not just its timestamp or project suffix; keep the worker counter intact.
+    // "cad-" + 16 hex characters + "-a" + 10 u32 digits fits exactly.
+    // Stored names of existing agents are deliberately not rewritten.
+    let digest = Sha256::digest(run_id.as_bytes());
+    let run_key: String = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    match number {
+        Some(number) => format!("cad-{run_key}-a{number}"),
+        None => format!("cadence-lead-{run_key}"),
+    }
+}
+
 fn agent_display_name(agent: &Agent) -> String {
     format!("[{}] {}", display_role(&agent.role), agent.title)
 }
@@ -1745,7 +1762,7 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        configured_agent_launch_args, display_role, ensure_agent_can_cancel,
+        configured_agent_launch_args, display_role, ensure_agent_can_cancel, herdr_agent_name,
         is_runner_availability_failure, next_cleanup_attempt, prune_integrated_agents,
         yolo_agent_args,
     };
@@ -1795,6 +1812,43 @@ mod tests {
                 .map(|(id, agent)| (id.into(), agent))
                 .collect(),
             last_error: None,
+        }
+    }
+
+    #[test]
+    fn generated_agent_names_fit_herdr_for_real_run_and_counter_limits() {
+        for run_id in [
+            "run-1786389189072-a2849321",
+            "run-1786389189073-a2849321",
+            "run-1786389189072-b2849321",
+            "run-1790639232123456789-a2849321",
+            "legacy run with Unicode: 日本語",
+        ] {
+            for number in [None, Some(0), Some(1), Some(1838), Some(u32::MAX)] {
+                let name = herdr_agent_name(run_id, number);
+                assert!(name.len() <= 32, "name exceeds Herdr limit: {name}");
+                assert!(name.as_bytes()[0].is_ascii_lowercase());
+                assert!(name.bytes().all(|c| c.is_ascii_lowercase()
+                    || c.is_ascii_digit()
+                    || c == b'-'
+                    || c == b'_'));
+            }
+        }
+    }
+
+    #[test]
+    fn generated_agent_names_are_stable_and_separate_runs_roles_and_numbers() {
+        let mut names = std::collections::HashSet::new();
+        for run_id in [
+            "run-1786389189072-a2849321",
+            "run-1786389189073-a2849321",
+            "run-1786389189072-b2849321",
+        ] {
+            for number in [None, Some(0), Some(1), Some(1838), Some(u32::MAX)] {
+                let name = herdr_agent_name(run_id, number);
+                assert_eq!(name, herdr_agent_name(run_id, number));
+                assert!(names.insert(name), "different identities share a name");
+            }
         }
     }
 

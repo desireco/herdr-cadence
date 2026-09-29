@@ -192,7 +192,7 @@ Leads and agents label findings as `High (Blockers)`, `Mid`, `Low`, or `Wish`.
 Cadence `Agent.status` is the authoritative lifecycle state; `observed_agent_status` is advisory runtime information. An agent's `idle` or `done` observation commonly occurs between turns and never alone justifies cancellation. After inspecting status/report and runtime evidence, the Lead may use `agent cancel <id> --force` for user intent, confirmed exit, nonresponse after follow-up/progress checks, or a verified blocker requiring reassignment (including stale base metadata). Routine recovery within the assigned task needs no additional user permission. Cancellation releases scope while retaining worktrees, reports, and commits; accepted work must still be integrated by the replacement. Cancellable states are `Starting`, `Working`, `Blocked`, `Completed`, and `Conflict`; `Integrating`, `Integrated`, `Failed`, and `Cancelled` cannot be cancelled.
 
 
-Agent reports require `--run-id <assigned-run>` or `CADENCE_RUN_ID`; new assignment prompts include the flag. For agents launched before this change, use their original assignment's run ID when resubmitting a report. Commands reject stale run IDs, and new agent names and branches include run identity.
+Agent reports require `--run-id <assigned-run>` or `CADENCE_RUN_ID`; new assignment prompts include the flag. For agents launched before this change, use their original assignment's run ID when resubmitting a report. Commands reject stale run IDs. New Herdr agent names use a short hash of the full run identity plus the worker number (or `lead`), staying within Herdr's 32-character limit. Branches retain the full run identity; existing stored agent names are unchanged.
 
 ## Develop
 

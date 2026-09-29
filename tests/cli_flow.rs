@@ -1555,6 +1555,16 @@ fn run_agent_flow_with_lead_options(
     let script = format!(
         r#"#!/bin/sh
 printf '%s\n' "$*" >> '{}'
+if [ "$1 $2" = "agent start" ]; then
+  name="$3"
+  if [ "${{#name}}" -gt 32 ]; then
+    printf '%s\n' 'invalid_agent_name: exceeds 32 characters' >&2
+    exit 1
+  fi
+  case "$name" in
+    [!a-z]*|*[!a-z0-9_-]*|'') exit 1 ;;
+  esac
+fi
 if [ "$1 $2" = "agent get" ]; then
   case "$3" in
     cadence-lead-*)
@@ -1563,7 +1573,7 @@ if [ "$1 $2" = "agent get" ]; then
         exit 0
       fi
       ;;
-    cadence-??????-a*|cadence-run-*-a*)
+    cadence-??????-a*|cadence-run-*-a*|cad-????????????????-a*)
       printf '%s\n' '{{"id":"test","result":{{"agent":{{"tab_id":"agent-tab"}}}}}}'
       exit 0
       ;;
@@ -1593,7 +1603,7 @@ case "$*" in
   "agent start cadence-lead-"*) : > '{}' ;;
 esac
 case "$*" in
-  "agent start cadence-"*)
+  "agent start cadence-"*|"agent start cad-"*)
     if [ -e '{}' ]; then
       case "$*" in
         *"--model qa-model"*)
@@ -2009,7 +2019,12 @@ fi
         assert!(calls.contains("create exactly one commit for changed files"));
     }
     assert!(calls.contains("agent start cadence-"));
-    assert!(calls.contains(&format!("agent start cadence-{active_run}-a1")));
+    let run_digest = <sha2::Sha256 as sha2::Digest>::digest(active_run.as_bytes());
+    let run_key: String = run_digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert!(calls.contains(&format!("agent start cad-{run_key}-a1")));
     assert!(calls.contains(&format!("--run-id {active_run} agent complete agent-1")));
     let agent_launch = "--kind codex --pane pane-agent --timeout 120000 -- --model qa-model --config model_reasoning_effort=\"low\"";
     assert!(calls.contains(agent_launch));
@@ -2437,10 +2452,12 @@ fi
     );
 
     let calls = fs::read_to_string(&log).unwrap();
-    assert!(calls.contains("agent send-keys cadence-"));
+    assert!(calls.contains(&format!("agent send-keys cad-{run_key}-a")));
     assert!(calls.contains("ctrl+c"));
     let completion_notification = calls.rfind("agent prompt cadence-lead-").unwrap();
-    let agent_interrupt = calls.rfind("agent send-keys cadence-").unwrap();
+    let agent_interrupt = calls
+        .rfind(&format!("agent send-keys cad-{run_key}-a"))
+        .unwrap();
     assert!(
         completion_notification < agent_interrupt,
         "Lead completion notification must precede interrupting the completing agent"
